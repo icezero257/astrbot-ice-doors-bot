@@ -1,0 +1,9 @@
+name: doors_bot
+display_name: Doors Bot
+desc: QQ群活跃统计与Robux奖励系统（纯静默后台统计，不在群里发言）
+version: v2.4.3
+author: doors_bot
+repo: ""
+astrbot_version: ">=4.24.0"
+support_platforms:
+  - aiocqhttp

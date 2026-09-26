@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+config/
+config.zip
+deploy.sh
+
+# 本地私有：现网群号/QQ 黑名单，绝不进仓库
+local_ids.txt
+
+# 构建产物与运行数据
+release/
+doors_bot_data/*
+!doors_bot_data/README.md

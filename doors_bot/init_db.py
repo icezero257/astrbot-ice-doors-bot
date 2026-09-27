@@ -6,8 +6,9 @@ doors_bot - 数据库初始化与无损迁移
   daily_score   每日得分缓存
   month_score   月度总分: total=结算后的最终分, carry=上月结转, bonus=邀请奖励分,
                 rank=结算排名, robux=应发Robux, settled=是否已结算
-  join_log      入群记录（最新一次，含邀请人）
+  join_log      入群记录（最新一次，含邀请人；invited_src 标出邀请人是事件检测的还是人工绑定的）
   join_history  入群事件流水（只追加；同 qq 多条 = 退了又进，永久失去新人资格）
+  pending_bind  待人工确认的邀请关系（新人入群时开一个时限，超时或绑定成功即失效）
   members       NapCat 每小时同步的全群成员名单（未发言扣分名单，in_group 标记退群）
   user_info     QQ昵称缓存（榜单展示）
   bind          QQ <-> Roblox 绑定
@@ -119,6 +120,40 @@ def init(db_path: str | None = None) -> str:
         )
         """
     )
+    # 邀请人来源: 0=不知道(成员同步补录的老成员/主动入群) 1=入群事件检测到
+    # 2=邀请人自己在时限内绑定确认的 3=管理员在后台带两个参数代填的
+    _ensure_column(
+        c, "join_log", "invited_src", "invited_src INTEGER DEFAULT 0"
+    )
+    # OneBot 的入群方式: invite=有人拉 / approve=管理员审批 / link=链接或搜索入群。
+    # approve 时接口回的 operator_id 是点同意的管理员而不是拉人的人，所以单独存一份。
+    _ensure_column(c, "join_log", "join_kind", "join_kind TEXT")
+    # 入群时刻（epoch 秒）。join_date 只到日，老成员的时间靠成员同步从 NapCat 的
+    # join_time 回填这一列，插件没在线时进的人也能对上准确的入群时间。
+    _ensure_column(c, "join_log", "join_ts", "join_ts INTEGER DEFAULT 0")
+
+    # 待确认的邀请关系：只由入群事件写入（有精确到秒的入群时刻才能算时限），
+    # 成员同步不写它。绑定成功或超时都不再生效。
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_bind (
+            newbie_qq        INTEGER PRIMARY KEY,
+            group_id         INTEGER NOT NULL,
+            detected_inviter INTEGER DEFAULT 0,
+            join_ts          INTEGER NOT NULL,
+            bound_ts         INTEGER DEFAULT 0
+        )
+        """
+    )
+    # 老库的入群记录没有来源，能查到邀请人的一律按"事件检测到"处理
+    if c.execute(
+        "SELECT COUNT(*) FROM join_log WHERE COALESCE(invited_src,0)=0 "
+        "AND COALESCE(invited_by,0)!=0"
+    ).fetchone()[0]:
+        c.execute(
+            "UPDATE join_log SET invited_src=1 "
+            "WHERE COALESCE(invited_src,0)=0 AND COALESCE(invited_by,0)!=0"
+        )
 
     c.execute(
         """
@@ -136,6 +171,11 @@ def init(db_path: str | None = None) -> str:
         """
     )
     _ensure_column(c, "members", "in_group", "in_group INTEGER DEFAULT 1")
+    # NapCat 群成员列表带的 join_time（epoch 秒）。插件装之前就进群的人，
+    # 入群时刻只能由每小时的成员同步从这一列补回来。
+    _ensure_column(c, "members", "join_ts", "join_ts INTEGER DEFAULT 0")
+    # NapCat 群成员列表的 join_time（epoch 秒），插件装之前就进群的也拿得到
+    _ensure_column(c, "members", "join_ts", "join_ts INTEGER DEFAULT 0")
 
     # 入群事件流水（只追加）。同一 qq 出现 >=2 条即"退了又进"，永远不算新人。
     c.execute(
@@ -214,6 +254,19 @@ def init(db_path: str | None = None) -> str:
     # 用唯一索引兜底防重复发奖。
     c.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_newbie_qq ON newbie_bonus(newbie_qq)"
+    )
+
+    # 邀请关系的人工确认窗口：入群事件开一条，绑定成功写 bound_ts，过期的由启动/同步清理。
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_bind (
+            newbie_qq        INTEGER PRIMARY KEY,
+            group_id         INTEGER NOT NULL,
+            detected_inviter INTEGER DEFAULT 0,
+            join_ts          INTEGER NOT NULL,
+            bound_ts         INTEGER DEFAULT 0
+        )
+        """
     )
 
     c.execute(

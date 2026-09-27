@@ -162,6 +162,10 @@ def check_invite_bonus(
         LEFT JOIN newbie_bonus n ON n.newbie_qq = j.qq
         WHERE j.group_id=? AND j.invited_by != 0 AND n.newbie_qq IS NULL
           AND (SELECT COUNT(*) FROM join_history h WHERE h.qq = j.qq) <= 1
+          -- 管理员审批放行的那次入群，事件里带的人是审批人而不是拉人的人，
+          -- 不算邀请、也不给分；除非有人把它确认下来(invited_src 2=本人绑定 3=后台代填)。
+          AND (COALESCE(j.join_kind, '') != 'approve'
+               OR COALESCE(j.invited_src, 0) >= 2)
         """,
         (group_id,),
     ).fetchall()

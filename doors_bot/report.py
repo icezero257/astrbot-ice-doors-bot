@@ -1,7 +1,8 @@
 """
 doors_bot - 后台榜单渲染（仅 AstrBot WebUI 聊天窗 / 本地 cli.py 使用）
 
-- 群聊/私聊平台(aiocqhttp 等)不会触发这些指令，机器人在 QQ 里保持绝对静默
+- 这些榜单指令只在 AstrBot WebUI 聊天窗触发，QQ 里发不会命中，机器人照常不出声
+  （群里唯一能用的 /新人绑定 不经过本模块，它也只在群里改库+写日志，不回话）
 - 输出为无 emoji 的等宽对齐表格；ChatUI 侧用 fenced=True 包一层代码块保证对齐
 - 后台属于管理端，输出包含 Robux 列（已结算月为落库值，未结算月为实时预估）
 - 本模块只读库，任何改写/删除数据的操作在 admin_ops.py
@@ -29,6 +30,7 @@ from .runtime_config import (
     get_data_dir,
     get_db_path,
     get_group_id,
+    get_invite_bind_config,
     get_monthly_config,
     get_no_score_qqs,
     get_report_config,
@@ -38,9 +40,12 @@ from .runtime_config import (
 
 NAME_WIDTH = 32  # 用户列固定宽度 = QQ 昵称的最大显示宽度(中文按 2 列计)，短的名词也补满
 COL_RANK, COL_QQ, COL_SCORE, COL_COUNT, COL_MONEY = 6, 12, 10, 8, 12
-# 名次/用户/QQ/总分/Robux 全部定宽；日榜的"备注"列排在最后，不占列宽也不补齐
+# 日榜的得分列要放下"4 已达今日上限"这种标注，比月榜的纯数字宽一点
+CAP_TAG = "已达今日上限"
+COL_SCORE_DAY = 14
+# 名次/用户/QQ/得分(句数)/最后一列 全部定宽；备注排在最后，不占列宽也不补齐
 MONTH_WIDTHS = (COL_RANK, NAME_WIDTH, COL_QQ, COL_SCORE, COL_MONEY)
-DAY_WIDTHS = MONTH_WIDTHS[:4] + (COL_COUNT,)
+DAY_WIDTHS = (COL_RANK, NAME_WIDTH, COL_QQ, COL_SCORE_DAY, COL_COUNT)
 _INVISIBLE_CATEGORIES = ("Mn", "Me", "Cf", "Cc", "Cs", "Co", "Cn")
 # 韩文填充符、不间断空格这类"看起来是空白"的字符宽度随字体浮动，一律换成真空格
 _BLANKISH = {0x115F, 0x1160, 0x3164, 0xFFA0, 0x00A0, 0x2000, 0x2007, 0x202F}
@@ -157,8 +162,100 @@ def _day_cap(cfg: dict) -> float:
 
 
 def _day_note(score: float, cfg: dict) -> str:
-    """达上限的说明写在最后一列：它后面没有列，写多长都不会挤歪表格。"""
+    """达上限的说明：/查询 是整行文字，这里用全称。"""
     return "（已抵达今日上限）" if score >= _day_cap(cfg) - 1e-9 else ""
+
+
+def _is_day_capped(score: float, cfg: dict) -> bool:
+    return score >= _day_cap(cfg) - 1e-9
+
+
+def _day_widths(cfg: dict) -> tuple:
+    """日榜列宽：得分列跟着单日上限的位数走，上限调成两位数也不会截掉标注。"""
+    w = max(COL_SCORE_DAY, _width(_fmt_score(_day_cap(cfg))) + 1 + _width(CAP_TAG))
+    return (COL_RANK, NAME_WIDTH, COL_QQ, w, COL_COUNT)
+
+
+def _score_cell(score: float, cfg: dict) -> str:
+    """日榜的得分列：数字后面直接跟"已达今日上限"，不占备注列。
+
+    列宽由 _day_widths 按同一份配置算出来，所以这里不用怕标注被截断。
+    """
+    text = _fmt_score(score)
+    return f"{text} {CAP_TAG}" if _is_day_capped(score, cfg) else text
+
+
+def _inviter_text(inv: int, src: int, kind: str, names: dict[int, str]) -> str:
+    """备注里这一句只回答"这人是谁拉进来的"，不解释他是怎么进群的。
+
+    管理员放行的那次入群，事件里带的人是审批人而不是拉人的人：既不写他的名字，
+    也不给他计拉新分，等真正的邀请人发 /新人绑定 认领（见 daily_score 里同一口径）。
+    """
+    who = names.get(int(inv), "") or str(inv)
+    if int(inv) and src == 2:
+        return f"邀请人 {who}(本人已确认)"
+    if int(inv) and src == 3:
+        return f"邀请人 {who}(管理员代填)"
+    if kind == "approve":
+        return "邀请人待定(管理员放行，绑上才算拉新)"
+    if not int(inv):
+        if kind == "link":
+            return "自己搜群号入群，无邀请人"
+        return "邀请人未记到(入群那会儿插件不在线)"
+    return f"邀请人 {who}(未确认)"
+
+
+def _newbie_notes(
+    c: sqlite3.Cursor, names: dict[int, str], month: str
+) -> dict[int, str]:
+    """榜上标出本期的新人及其邀请人。不是新人就不给备注。"""
+    out: dict[int, str] = {}
+    try:
+        rows = c.execute(
+            "SELECT qq, COALESCE(invited_by,0), COALESCE(invited_src,0), "
+            "join_date, COALESCE(join_kind,'') FROM join_log"
+        ).fetchall()
+    except sqlite3.Error:
+        return out
+    for qq, inv, src, jd, kind in rows:
+        if not is_newbie(int(qq), month, c):
+            continue
+        when = str(jd or "")[5:]
+        head = f"新人{when}入群" if when else "新人"
+        out[int(qq)] = f"{head}，{_inviter_text(int(inv), int(src), kind, names)}"
+    return out
+
+
+def _invite_award_notes(
+    c: sqlite3.Cursor, names: dict[int, str], month: str
+) -> dict[int, str]:
+    """谁在这个月因为拉新拿到过邀请分（奖励记在邀请人头上，被拉的人不加分）。"""
+    grouped: dict[int, list[str]] = {}
+    try:
+        rows = c.execute(
+            "SELECT inviter_qq, newbie_qq, COALESCE(bonus,0) FROM newbie_bonus "
+            "WHERE awarded_month=?",
+            (month,),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    for inv, newbie, bonus in rows:
+        who = names.get(int(newbie), "") or str(newbie)
+        grouped.setdefault(int(inv), []).append(
+            f"拉新 +{_fmt_score(bonus)}（{who} 达标）"
+        )
+    return {qq: "，".join(v) for qq, v in grouped.items()}
+
+
+def _notes(
+    c: sqlite3.Cursor, names: dict[int, str], month: str
+) -> dict[int, str]:
+    """一张榜的备注：新人/邀请人 与 拉新得分，都拼在最后一列里。"""
+    out = dict(_newbie_notes(c, names, month))
+    awards = _invite_award_notes(c, names, month)
+    for qq, text in awards.items():
+        out[qq] = f"{out[qq]}；{text}" if qq in out else text
+    return out
 
 
 def _names(c: sqlite3.Cursor) -> dict[int, str]:
@@ -263,6 +360,7 @@ def render_day_board(
     try:
         c = conn.cursor()
         names = _names(c)
+        notes_map = _notes(c, names, date_str[:7])
         rows: list[tuple[int, int, float]] = []  # (qq, sentences, score)
         if is_today:
             vc = valid_msg_counts(
@@ -306,21 +404,24 @@ def render_day_board(
     body = [title] + _table(
         ["名次", "用户", "QQ", "得分", "句数", "备注"],
         [
-            _board_row(rank, qq, names, _fmt_score(score), cnt, _day_note(score, cfg))
+            _board_row(
+                rank, qq, names, _score_cell(score, cfg), cnt,
+                notes_map.get(qq, ""),
+            )
             for rank, (qq, cnt, score) in
             zip(_tie_ranks([s for _, _, s in shown]), shown)
         ],
         aligns="rllrrl",
-        widths=DAY_WIDTHS,
+        widths=_day_widths(cfg),
     )
     tail = f"... 另有 {hidden} 行未显示" if hidden else ""
     if tail:
         body.append(tail)
     if note:
         body.append(note)
-    if any(score >= _day_cap(cfg) - 1e-9 for _, _, score in shown):
+    if any(_is_day_capped(s, cfg) for _, _, s in shown):
         body.append(
-            f"注: 单日上限 {_day_cap(cfg):g} 分"
+            f"注: 得分里的\"{CAP_TAG}\"= 当天把单日上限 {_day_cap(cfg):g} 分拿满了"
             f"（发言分上限 {cfg['daily_cap']:g} + 达量奖励 {cfg['bonus_score']:g}）"
         )
     return _fence("\n".join(body), fenced)
@@ -337,16 +438,18 @@ def _render_settled_month(
         "WHERE month=? AND settled=1 ORDER BY total DESC, qq",
         (month,),
     ).fetchall()
+    notes_map = _notes(c, names, month)
     shown, hidden = _apply_limit([[q, t, r] for q, t, r in rows], limit, score_at=1)
     body = [title] + _table(
-        ["名次", "用户", "QQ", "总分", "应发Robux"],
+        ["名次", "用户", "QQ", "总分", "应发Robux", "备注"],
         [
             _board_row(rank, int(q), names, _fmt_score(float(t)),
-                       f"{_fmt_score(float(ru))}R" if ru else "-")
+                       f"{_fmt_score(float(ru))}R" if ru else "-",
+                       notes_map.get(int(q), ""))
             for rank, (q, t, ru) in
             zip(_tie_ranks([float(t) for q, t, r in shown]), shown)
         ],
-        aligns="rllrr",
+        aligns="rllrrl",
     )
     if hidden:
         body.append(f"... 另有 {hidden} 行未显示")
@@ -404,6 +507,7 @@ def _render_live_month(
 
     # /扣除 的手工账调整：与结算同一口径，实时榜不含它就与最终月榜对不上
     adjust = adjust_totals(c, month)
+    notes_map = _notes(c, names, month)
 
     finals: list[tuple[int, float]] = []
     for qq in set(daily) | set(credits) | set(adjust):
@@ -433,14 +537,15 @@ def _render_live_month(
             f"（奖金池 {top_n * per}R 封顶，不会超发）"
         )
     body = [title] + _table(
-        ["名次", "用户", "QQ", "预估总分", "奖金"],
+        ["名次", "用户", "QQ", "预估总分", "奖金", "备注"],
         [
             _board_row(rank, qq, names, _fmt_score(total),
-                       f"{awards.get(qq, 0.0):g}R" if awards.get(qq) else "-")
+                       f"{awards.get(qq, 0.0):g}R" if awards.get(qq) else "-",
+                       notes_map.get(qq, ""))
             for rank, (qq, total) in
             zip(_tie_ranks([t for q, t in shown]), shown)
         ],
-        aligns="rllrr",
+        aligns="rllrrl",
     )
     if hidden:
         body.append(f"... 另有 {hidden} 行未显示")
@@ -535,8 +640,15 @@ def _month_credits(c: sqlite3.Cursor, qq: int, month: str) -> dict[int, tuple[fl
     return {int(qq): (float(row[0] or 0), float(row[1] or 0))} if row else {}
 
 
-def _join_line(info: dict | None, member: tuple | None, join_log_date: str | None) -> str:
-    """入群时间：接口的 join_time 精确到秒（显示到分钟），库里同步的快照只到日。"""
+def _join_line(
+    info: dict | None, member: tuple | None, join_log_date: str | None,
+    db_ts: int = 0, ts_src: str = "NapCat 记的入群时刻",
+) -> str:
+    """入群时间：优先现调接口的 join_time，其次库里存的秒级时刻，最后才是只到日的日期。
+
+    插件装之前就进群的人没有入群事件，但 get_group_member_list 的 join_time 是准的，
+    每小时同步把它存进 join_ts；2025 年进群的人到这里就能显示到分钟。
+    """
     ts = (info or {}).get("join_time")
     try:
         if int(ts or 0) > 0:
@@ -544,9 +656,15 @@ def _join_line(info: dict | None, member: tuple | None, join_log_date: str | Non
                 "%Y-%m-%d %H:%M") + "（NapCat 实时）"
     except (TypeError, ValueError):
         pass
+    try:
+        if int(db_ts or 0) > 0:
+            return (datetime.datetime.fromtimestamp(int(db_ts)).strftime(
+                "%Y-%m-%d %H:%M") + f"（{ts_src}）")
+    except (TypeError, ValueError, OSError):
+        pass
     db_date = (member or (None, None, None, None))[1] or join_log_date
     if db_date:
-        return f"{db_date}（只到日，NapCat 连上后可到秒）"
+        return f"{db_date}（只到日）"
     return "未知（NapCat 未连接，库里也没有该成员的入群记录）"
 
 
@@ -600,16 +718,26 @@ def render_profile(
         days = _user_days(conn, c, qq, cfg)
         try:
             member = c.execute(
-                "SELECT nickname, join_date, role, COALESCE(in_group,1) FROM members "
-                "WHERE qq=? AND group_id=?",
+                "SELECT nickname, join_date, role, COALESCE(in_group,1), "
+                "COALESCE(join_ts,0) FROM members WHERE qq=? AND group_id=?",
                 (int(qq), group_id),
             ).fetchone()
         except sqlite3.Error:
             member = None
         jl = c.execute(
-            "SELECT join_date FROM join_log WHERE qq=?", (int(qq),)
+            "SELECT join_date, COALESCE(invited_by,0), COALESCE(invited_src,0), "
+            "COALESCE(join_kind,''), COALESCE(join_ts,0) FROM join_log WHERE qq=?",
+            (int(qq),)
         ).fetchone()
         join_log_date = jl[0] if jl else None
+        # 入群时刻：成员同步从 NapCat 名单拿的 join_time 最普遍（老成员也有），
+        # 入群事件写的那份同样到秒；两边哪个新用哪个，标注来源
+        _m_ts = int((member or [0] * 5)[4] or 0)
+        _j_ts = int((jl or [0] * 5)[4] or 0)
+        db_ts, ts_src = (_m_ts, "群成员同步") if _m_ts >= _j_ts else (_j_ts, "入群事件")
+        invite_note = _inviter_text(int(jl[1]), int(jl[2]), str(jl[3]), names) if jl else ""
+        newbie_now = bool(jl) and is_newbie(int(qq), month, c)
+        invite_bonus = _invite_award_notes(c, names, month).get(int(qq), "")
         try:
             bind = c.execute(
                 "SELECT roblox_id FROM bind WHERE qq=?", (int(qq),)
@@ -667,11 +795,19 @@ def render_profile(
         f"总分数获得：{_fmt_score(total_score)}",
         "[群数据]",
         f"昵称：{nickname}",
-        f"入群时间：{_join_line(info, member, join_log_date)}",
+        f"入群时间：{_join_line(info, member, join_log_date, db_ts, ts_src)}",
+        f"邀请关系：{invite_note or '没有入群记录（插件没抓到这条入群事件）'}",
         f"游号：{bound or '未绑定（bind 表里没有它的记录）'}",
         "[QQ会员信息]",
         _vip_line(info),
     ]
+    if newbie_now:
+        lines.append(
+            f"注: 本月按新人计（{month} 及次月），发言分 ×{cfg_m['newbie_multiplier']:g}"
+            "；入群两次起不再算新人"
+        )
+    if invite_bonus:
+        lines.append(f"注: 本月拉新得分 {invite_bonus}")
     if member and not member[3]:
         lines.append("状态: 已退群（成员同步时不在名单里，不再参与扣分）")
     if int(qq) in get_no_score_qqs():
@@ -736,8 +872,26 @@ def render_diag(now: datetime.datetime | None = None, fenced: bool = False) -> s
             ).fetchone()
         except sqlite3.Error:
             adj_cnt, adj_sum = 0, 0.0
+        try:
+            p = c.execute(
+                "SELECT COUNT(*), MAX(join_ts) FROM pending_bind WHERE bound_ts=0"
+            ).fetchone()
+            pend_cnt, pend_ts = int(p[0] or 0), int(p[1] or 0)
+        except sqlite3.Error:
+            pend_cnt, pend_ts = 0, 0
+        confirmed = c.execute(
+            "SELECT COUNT(*) FROM join_log WHERE COALESCE(invited_src,0) IN (2,3)"
+        ).fetchone()[0]
     finally:
         conn.close()
+
+    bind_cfg = get_invite_bind_config()
+    pend_line = (
+        f"{pend_cnt} 个窗口待确认，最近一次入群 "
+        f"{datetime.datetime.fromtimestamp(pend_ts):%m-%d %H:%M}"
+        if pend_cnt
+        else "无"
+    )
 
     sched_cfg = get_scheduler_config()
     group_id = get_group_id()
@@ -753,6 +907,10 @@ def render_diag(now: datetime.datetime | None = None, fenced: bool = False) -> s
         f"最近发言: 日期 {latest[0] or '无'} 时间 {last_ts}",
         f"本月待补算日: {', '.join(missing) if missing else '无'}",
         f"本月手工调整: {adj_cnt} 笔 合计 {_fmt_score(adj_sum)} 分（/扣除 记账，重算日分不会抹掉）",
+        f"邀请确认窗口: {pend_line}（窗口 {bind_cfg['window_minutes']} 分钟，"
+        f"指令 {'开' if bind_cfg['enabled'] else '关'}，群内提示 "
+        f"{'开' if bind_cfg['prompt'] else '关，机器人在群里不说话'}）；"
+        f"已人工确认 {confirmed} 人",
     ]
     if group_id <= 0:
         lines.append(

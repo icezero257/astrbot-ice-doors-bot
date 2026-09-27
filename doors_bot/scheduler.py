@@ -346,7 +346,7 @@ async def fetch_profile(qq: int) -> tuple[dict | None, str]:
 
     三条只读接口：`get_group_member_info`(入群时间精确到秒)、`get_stranger_info`
     (QQ 会员/超级会员/年费，群成员接口里没有这几个字段)、`get_group_info`(群名)。
-    每小时同步已经把 join_time 写进 members.join_date，但只到"日"，所以要现调。
+    入群时刻每小时的成员同步已经存进 join_ts，所以这一路主要是取会员状态；
     NapCat 没连上时返回 (None, "")，调用方回落到库里的快照，查询本身照样能出结果。
     """
     group_id = get_group_id()
@@ -437,29 +437,34 @@ async def member_sync_job(
             if qq <= 0:
                 continue
             join_date = None
-            join_ts = m.get("join_time") or 0
             try:
-                if int(join_ts) > 0:
+                join_ts = max(0, int(m.get("join_time") or 0))
+            except (TypeError, ValueError):
+                join_ts = 0
+            if join_ts:
+                try:
                     join_date = datetime.datetime.fromtimestamp(
-                        int(join_ts), _TZ or datetime.datetime.now().astimezone().tzinfo
+                        join_ts, _TZ or datetime.datetime.now().astimezone().tzinfo
                     ).strftime("%Y-%m-%d")
-            except (TypeError, ValueError, OSError):
-                join_date = None
+                except (TypeError, ValueError, OSError):
+                    join_date = None
             nickname = str(m.get("card") or m.get("nickname") or "") or None
             role = str(m.get("role") or "")
             c.execute(
                 """
                 INSERT INTO members(qq, group_id, nickname, join_date, role,
-                                    first_seen, last_sync)
-                VALUES(?,?,?,?,?,?,?)
+                                    join_ts, first_seen, last_sync)
+                VALUES(?,?,?,?,?,?,?,?)
                 ON CONFLICT(qq, group_id) DO UPDATE SET
                     nickname=COALESCE(excluded.nickname, members.nickname),
                     join_date=COALESCE(excluded.join_date, members.join_date),
                     role=excluded.role,
+                    join_ts=CASE WHEN excluded.join_ts != 0 THEN excluded.join_ts
+                                 ELSE members.join_ts END,
                     in_group=1,
                     last_sync=excluded.last_sync
                 """,
-                (qq, group_id, nickname, join_date, role, now_str, now_str),
+                (qq, group_id, nickname, join_date, role, join_ts, now_str, now_str),
             )
             if nickname:
                 _upsert_user(c, qq, nickname)
@@ -469,10 +474,16 @@ async def member_sync_job(
                 "SELECT 1 FROM join_log WHERE qq=?", (qq,)
             ).fetchone():
                 c.execute(
-                    "INSERT INTO join_log(qq, group_id, invited_by, join_date) "
-                    "VALUES(?,?,0,?)",
-                    (qq, group_id, join_date),
+                    "INSERT INTO join_log(qq, group_id, invited_by, join_date, join_ts) "
+                    "VALUES(?,?,0,?,?)",
+                    (qq, group_id, join_date, join_ts),
                 )
+            elif join_ts and c.execute(
+                "SELECT 1 FROM join_log WHERE qq=? AND COALESCE(join_ts,0)=0", (qq,)
+            ).fetchone():
+                # 入群事件那会儿还没存秒级时刻（或插件不在线时补的记录）：
+                # 名单里的 join_time 是准的，顺手把它补成精确到秒的入群时间
+                c.execute("UPDATE join_log SET join_ts=? WHERE qq=?", (join_ts, qq))
         # 本次名单里没有的人 → 已退群，标记 in_group=0（停止扣分、防回流误判）
         c.execute(
             "UPDATE members SET in_group=0 WHERE group_id=? AND last_sync < ?",

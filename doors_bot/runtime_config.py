@@ -210,6 +210,21 @@ def get_report_config() -> dict[str, Any]:
     return {"display_limit": _to_int(section.get("display_limit"), 0)}
 
 
+def get_invite_bind_config() -> dict[str, Any]:
+    """新人邀请关系的人工确认窗口。
+
+    enabled=False 时只保留入群事件自动记的那份，`新人绑定` 指令不生效。
+    prompt=False 时插件在群里依然一个字都不发（默认），邀请人需要自己知道有这条指令；
+    打开后新人进群会在群里 @邀请人 催一次。
+    """
+    section = _section("invite_bind")
+    return {
+        "enabled": _to_bool(section.get("enabled"), True),
+        "window_minutes": max(1, _to_int(section.get("window_minutes"), 5)),
+        "prompt": _to_bool(section.get("prompt"), False),
+    }
+
+
 def get_scheduler_config() -> dict[str, Any]:
     section = _section("scheduler")
     return {

@@ -1,7 +1,13 @@
 name: doors_bot
 display_name: Doors Bot
-desc: QQ群活跃统计与Robux奖励系统（纯静默后台统计，不在群里发言）
-version: v2.5.4
+desc: >-
+  QQ 群活跃统计与 Robux 月度结算。发言只在后台入库计分，机器人在群里完全不出声；
+  看榜、自检、改数据的指令都在 AstrBot WebUI 聊天窗里用（日榜 /日榜、月榜 /月榜、
+  单人档 /查询、自检 /自检，运维指令末尾要加 确认）。/新人绑定 群内后台都能用：
+  群里邀请人本人认领自己拉进来的新人（不回话，只写库、写日志），后台由管理员
+  带邀请人QQ代填，结果看日榜月榜的备注列。
+short_desc: QQ 群活跃统计 + Robux 月结，群内静默、榜单在后台看
+version: v2.5.5
 author: 冰凌不是冰凌
 repo: ""
 astrbot_version: ">=4.24.0"

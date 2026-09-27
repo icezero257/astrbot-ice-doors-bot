@@ -32,6 +32,7 @@ from .runtime_config import (
     get_daily_config,
     get_db_path,
     get_group_id,
+    get_invite_bind_config,
     get_no_score_qqs,
 )
 
@@ -199,8 +200,13 @@ async def handle_group_message(event, _now: int | None = None) -> None:
         conn.close()
 
 
-async def handle_group_join(event) -> None:
-    """处理 NapCat 转发的群入群通知 (group_increase notice)。"""
+async def handle_group_join(event, _now: int | None = None) -> dict | None:
+    """处理 NapCat 转发的群入群通知 (group_increase notice)。
+
+    返回 None 表示这条通知不归我们处理。开出了人工确认窗口、且配置页允许在群里
+    催一句时，返回 {"newbie": 新人QQ, "inviter": 入群事件里带的那个QQ,
+    "approve": 这次是不是管理员放行}，由调用方决定怎么问。
+    """
     raw = getattr(event.message_obj, "raw_message", None)
     if not isinstance(raw, dict):
         return
@@ -225,7 +231,10 @@ async def handle_group_join(event) -> None:
     if invited_by == user_id:
         # 主动入群(群号/二维码)时 operator_id 常常就是本人，不能算自己邀请自己
         invited_by = 0
+    # invite=有人拉 / approve=管理员审批(此时 operator_id 是审批人) / link=搜群号进来
+    join_kind = str(raw.get("sub_type") or "") or ""
     join_date = datetime.date.today().strftime("%Y-%m-%d")
+    join_ts = int(_now if _now is not None else time.time())
 
     conn = get_db()
     try:
@@ -264,24 +273,68 @@ async def handle_group_join(event) -> None:
 
         cursor.execute(
             """
-            INSERT INTO join_log (qq, group_id, invited_by, join_date)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO join_log (qq, group_id, invited_by, join_date,
+                                  invited_src, join_kind, join_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(qq) DO UPDATE SET
                 group_id=excluded.group_id,
                 invited_by=CASE
                     WHEN excluded.invited_by != 0 THEN excluded.invited_by
                     ELSE join_log.invited_by
                 END,
-                join_date=excluded.join_date
+                invited_src=CASE
+                    WHEN excluded.invited_by != 0 THEN excluded.invited_src
+                    ELSE join_log.invited_src
+                END,
+                join_kind=excluded.join_kind,
+                join_date=excluded.join_date,
+                join_ts=excluded.join_ts
             """,
-            (user_id, target_group, invited_by, join_date),
+            (user_id, target_group, invited_by, join_date,
+             1 if invited_by else 0, join_kind, join_ts),
         )
-        # 通知事件里适配器把 sender.nickname 填成 user_id 本身，写进去只会让
-        # 榜单显示成一串数字；真昵称由群成员同步与后续发言补齐。
+        bind_cfg = get_invite_bind_config()
+        if bind_cfg["enabled"]:
+            # 开一个确认窗口：这次看到谁拉的人只是"检测"，邀请人在窗口内自己发指令
+            # 绑定才算人工确认。只记最新一次入群，绑定成功或超时后不再有效。
+            # 审批放行那次的 operator_id 是管理员、不是拉人的人，所以窗口里当成"没检测到"，
+            # 等真正的邀请人来认领；join_log 仍留着当时是谁放行的，便于事后核对。
+            cursor.execute(
+                """
+                INSERT INTO pending_bind
+                    (newbie_qq, group_id, detected_inviter, join_ts, bound_ts)
+                VALUES(?,?,?,?,0)
+                ON CONFLICT(newbie_qq) DO UPDATE SET
+                    group_id=excluded.group_id,
+                    detected_inviter=excluded.detected_inviter,
+                    join_ts=excluded.join_ts,
+                    bound_ts=0
+                """,
+                (user_id, target_group,
+                 0 if join_kind == "approve" else invited_by, join_ts),
+            )
+            cursor.execute(
+                "DELETE FROM pending_bind WHERE join_ts < ? AND bound_ts=0",
+                (join_ts - 86400,),
+            )
+        # 这里不写 user_info：通知事件里适配器把 sender.nickname 填成 user_id 本身，
+        # 写进去只会让榜单显示成一串数字，真昵称由成员同步与后续发言补齐。
         conn.commit()
         logger.info(
-            f"[doors_bot] 新成员加入 {user_id} 邀请人 {invited_by} "
-            f"方式 {raw.get('sub_type') or '-'}"
+            f"[doors_bot] 新成员加入 {user_id} "
+            + (
+                f"审批人 {invited_by}(不算邀请人)"
+                if join_kind == "approve"
+                else f"邀请人 {invited_by or '未检测到'}"
+            )
+            + f" 方式 {raw.get('sub_type') or '-'}"
         )
+        # 只有知道该问谁(检测到 operator_id)时才提示，链接/搜索入群没有对象可问。
+        if bind_cfg["enabled"] and bind_cfg["prompt"] and invited_by:
+            return {
+                "newbie": user_id,
+                "inviter": invited_by,
+                "approve": join_kind == "approve",
+            }
     finally:
         conn.close()

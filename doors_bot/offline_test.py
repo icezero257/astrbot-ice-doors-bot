@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -397,6 +398,7 @@ check("未发言扣分扣完为止(-0.15)", r3 is not None and abs(r3[0] + 0.15)
 # 真新人101(邀请人201): 12-01..12-10 每天11条有效 → 达标A
 # 回流新人103(邀请人202): 同样数据但2条流水 → 不达标(资格)
 # 真新人105(邀请人203): 每天20条 → 也达标(条件A+B)
+# 新人107(204 只是放行他的管理员)/109(205 是绑过的新人邀请人): 数据与101相同
 for qq, inv, jd in ((101, 201, "2099-12-01"), (103, 202, "2099-12-01"),
                     (105, 203, "2099-12-01")):
     conn2.execute(
@@ -407,6 +409,15 @@ for qq, inv, jd in ((101, 201, "2099-12-01"), (103, 202, "2099-12-01"),
         "INSERT INTO join_history(qq, group_id, join_date, invited_by) VALUES(?,?,?,?)",
         (qq, GROUP, jd, inv),
     )
+for qq, inv, src in ((107, 204, 1), (109, 205, 2)):
+    conn2.execute(
+        "INSERT INTO join_log(qq, group_id, invited_by, join_date, invited_src, "
+        "join_kind) VALUES(?,?,?,'2099-12-01',?,'approve')", (qq, GROUP, inv, src),
+    )
+    conn2.execute(
+        "INSERT INTO join_history(qq, group_id, join_date, invited_by) "
+        "VALUES(?,?,'2099-12-01',?)", (qq, GROUP, inv),
+    )
 conn2.execute(
     "INSERT INTO join_history(qq, group_id, join_date, invited_by) VALUES(103,?, '2099-01-01', 0)",
     (GROUP,),
@@ -414,7 +425,7 @@ conn2.execute(
 for day in range(1, 11):
     d = f"2099-12-{day:02d}"
     base = int(datetime.datetime(2099, 12, day, 12, 0).timestamp())
-    for n_qq, cnt in ((101, 11), (103, 11), (105, 20)):
+    for n_qq, cnt in ((101, 11), (103, 11), (105, 20), (107, 11), (109, 11)):
         for i in range(cnt):
             add_msg(conn2, n_qq, d, base + i * 10)
             add_msg(conn2, 999, d, base + i * 10 + 5)  # 陪聊
@@ -427,6 +438,8 @@ b = dict(
 check("真新人达标→邀请人+10", b.get(201) == 10, b)
 check("回流新人不发邀请奖励", b.get(202) is None, b)
 check("每天20条也达标", b.get(203) == 10, b)
+check("管理员审批放行的入群不给审批人拉新分", b.get(204) is None, b)
+check("审批入群但邀请人自己绑定确认过的照常给分", b.get(205) == 10, b)
 
 ds.calc_day("2099-12-10", DCFG, MCfg, GROUP, set())
 n = conn2.execute(
@@ -453,7 +466,7 @@ conn3 = sqlite3.connect(p3)
 # u6 普通 1.0 → 未获奖结转 0.05 进 2100-01
 # u8 邀请分2.0 → 0+2.0
 S = conn3.execute
-S("INSERT INTO join_log VALUES(1001,?,0,'2099-12-05')", (GROUP,))
+S("INSERT INTO join_log(qq, group_id, invited_by, join_date) VALUES(1001,?,0,'2099-12-05')", (GROUP,))
 S("INSERT INTO join_history(qq, group_id, join_date) VALUES(1001,?,'2099-12-05')", (GROUP,))
 for d, sc in (("2099-12-01", 2.0), ("2099-12-02", 2.0), ("2099-12-03", 2.0)):
     S("INSERT INTO daily_score VALUES(1001,?,?,20)", (d, sc))
@@ -569,9 +582,19 @@ report_src = pathlib.Path(HERE, "report.py").read_text("utf-8")
 check("QQ 指令渲染模块已删除", not os.path.exists(os.path.join(HERE, "commands.py")))
 n_cmd = main_src.count("@filter.command")
 n_gate = main_src.count("PlatformAdapterType.WEBCHAT")
-check("后台指令存在且全部仅限WebUI", n_cmd == 13 and n_cmd == n_gate, (n_cmd, n_gate))
+check("后台指令全部仅限WebUI，只有 新人绑定 例外(邀请人不会去开后台)",
+      n_cmd == 14 and n_gate == 13
+      and "platform_adapter_type" not in
+      main_src.split("async def cmd_bind_inviter")[0].rsplit("@filter.command", 1)[-1],
+      (n_cmd, n_gate))
 n_alias = main_src.count('alias={"/')
-check("后台指令带 /前缀 别名(修复ChatUI无响应)", n_alias == 13, n_alias)
+check("后台指令带 /前缀 别名(修复ChatUI无响应)", n_alias == 14, n_alias)
+_no_desc = [
+    m.group(1) for m in re.finditer(r'@filter\.command\((.*?)\)\n', main_src, re.S)
+    if "desc=" not in m.group(1)
+]
+check("每条指令都写了 desc(AstrBot 后台的指令简介取 desc，没有就显示无描述)",
+      len(_no_desc) == 0 and main_src.count("desc=") >= 14, _no_desc)
 check("main.py 无发送/回复代码", "send_message" not in main_src
       and "make_result" not in main_src and "reply" not in main_src)
 _gn_seg = main_src.split("async def group_notice")[0].rsplit("@filter", 1)[-1]
@@ -631,9 +654,10 @@ class FakeContext:
 bot = DoorsBot(FakeContext(), {"db_path": p4, "group_id": str(GROUP)})
 check("QQ 事件只读入口仍在",
       hasattr(bot, "group_message") and hasattr(bot, "group_notice"))
-check("查看指令 rep_* 六个 + 运维指令 cmd_* 七个",
+check("查看指令 rep_* 六个 + 运维与群内指令 cmd_* 八个",
       sum(1 for n in dir(bot) if n.startswith("rep_")) == 6
-      and sum(1 for n in dir(bot) if n.startswith("cmd_")) == 7,
+      and sum(1 for n in dir(bot) if n.startswith("cmd_")) == 8
+      and hasattr(bot, "cmd_bind_inviter"),
       [n for n in dir(bot) if n.startswith(("rep_", "cmd_"))])
 check("/查询 是只读的 rep_ 指令，不套二次确认",
       "async def rep_profile" in main_src
@@ -657,7 +681,22 @@ from doors_bot import report  # noqa: E402
 
 p5 = make_db("db5")
 conn5 = sqlite3.connect(p5)
-conn5.execute("INSERT INTO join_log VALUES(1001,?,0,'2099-12-05')", (GROUP,))
+
+
+def _fixed_w(line: str, widths: tuple[int, ...]) -> int:
+    """定宽那几列的显示宽度；末尾自由列（备注）多长都不算进来。"""
+    target = sum(widths) + 2 * (len(widths) - 1)
+    used, i = 0, 0
+    while i < len(line) and used < target:
+        used += report._width(line[i])
+        i += 1
+    return used if used >= target else -1
+
+
+conn5.execute(
+    "INSERT INTO join_log(qq, group_id, invited_by, join_date) VALUES(1001,?,0,'2099-12-05')",
+    (GROUP,),
+)
 conn5.execute(
     "INSERT INTO join_history(qq, group_id, join_date) VALUES(1001,?,'2099-12-05')",
     (GROUP,),
@@ -681,7 +720,7 @@ check("上月榜表头含名次与应发Robux列",
 check("上月榜新人5.5分居首", lm.splitlines()[2].split()[0] == "1"
       and "5.5" in lm.splitlines()[2], lm)
 check("上月榜按显示宽度对齐",
-      len({report._width(l) for l in lm.splitlines()[1:]}) == 1, lm)
+      len({_fixed_w(l, report.MONTH_WIDTHS) for l in lm.splitlines()[1:]}) == 1, lm)
 
 cm = report.render_current_month_board(now=datetime.datetime(2100, 1, 15, 12, 0))
 check("本月榜含区间至当前", "2100-01-01" in cm and "01-15" in cm, cm)
@@ -693,15 +732,43 @@ db = report.render_day_board(
 )
 check("日榜空数据提示", "暂无有效发言" in db, db)
 
+
+def _split_fixed(line, widths):
+    """按已知列宽把定宽表的一行切回各列，返回 (定宽列, 末尾自由列)。"""
+    cells, pos = [], 0
+    for w in widths:
+        seg, used = [], 0
+        while pos < len(line) and used < w:
+            used += report._width(line[pos])
+            seg.append(line[pos])
+            pos += 1
+        cells.append("".join(seg))
+        pos += 2
+    return cells, line[pos:]
+
+
 # 同分并列 + 达上限标注 + 列宽不截断
 d5 = report.render_day_board("2099-12-03", now=datetime.datetime(2099, 12, 5, 10, 0))
-check("日榜达单日上限的得分带标注", d5.count("（已抵达今日上限）") == 4, d5)
+_cut5 = [l for l in d5.splitlines()[2:] if not l.startswith("注:")]
+check("日榜达上限的标注写在得分列",
+      sum(1 for l in _cut5
+          if _split_fixed(l, report.DAY_WIDTHS)[0][3].endswith(report.CAP_TAG)) == 4, d5)
+check("日榜得分列不再靠备注解释达上限",
+      all(report._day_note(4.0, get_daily_config()) not in l for l in _cut5), d5)
 check("日榜附单日上限说明", "单日上限 4 分" in d5 and "发言分上限 3" in d5, d5)
+check("达上限标注的写法就是 已达今日上限",
+      report.CAP_TAG == "已达今日上限" and report.CAP_TAG in d5, d5)
+check("上限换成两位数时得分列跟着加宽，标注不被截断",
+      report._day_widths({"daily_cap": 98, "bonus_score": 2})[3]
+      == report._width("100 " + report.CAP_TAG)
+      and report._width(report._score_cell(100, {"daily_cap": 98, "bonus_score": 2}))
+      <= report._day_widths({"daily_cap": 98, "bonus_score": 2})[3],
+      report._score_cell(100, {"daily_cap": 98, "bonus_score": 2}))
 check("日榜同分并列名次(1,2,2,2,5)",
       [l.split()[0] for l in d5.splitlines()[2:] if not l.startswith("注:")]
       == ["1", "2", "2", "2", "5"], d5)
-_tied2 = [l.split()[4] for l in d5.splitlines()[2:]
-          if not l.startswith("注:") and l.split()[0] == "2"]
+_tied2 = [_split_fixed(l, report.DAY_WIDTHS)[0][4].strip() for l in _cut5
+          if _split_fixed(l, report.DAY_WIDTHS)[0][0].strip() == "2"]
 check("日榜并列第2名内部按句数降序", _tied2 == ["80", "60", "45"], _tied2)
 # 今日实时榜：两人都抵达单日上限(60/75 句)，同为第1名时按句数降序
 T5 = int(datetime.datetime(2099, 12, 20, 12, 0).timestamp())
@@ -711,11 +778,12 @@ for i in range(75):
         add_msg(conn5, 1010, "2099-12-20", T5 + i * 2 + 1)
 conn5.commit()
 rt = report.render_day_board("2099-12-20", now=datetime.datetime(2099, 12, 20, 23, 0))
-rt_rows = [l.split() for l in rt.splitlines()[2:] if not l.startswith("注:")]
+_rt = [_split_fixed(l, report.DAY_WIDTHS)[0]
+       for l in rt.splitlines()[2:] if not l.startswith("注:")]
 check("实时榜两行同为第1名",
-      [r[0] for r in rt_rows] == ["1", "1"]
-      and all("已抵达今日上限" in l for l in rt if "101" in l), rt)
-check("实时榜并列第一内部按句数降序", [r[4] for r in rt_rows] == ["75", "60"], rt)
+      [r[0].strip() for r in _rt] == ["1", "1"]
+      and all(report.CAP_TAG in r[3] for r in _rt), rt)
+check("实时榜并列第一内部按句数降序", [r[4].strip() for r in _rt] == ["75", "60"], rt)
 conn5.execute("DELETE FROM msg WHERE date='2099-12-20'")
 conn5.commit()
 # 并列把奖金池撑爆时，实时月榜要显示"整组平分、封顶不超发"的说明
@@ -764,33 +832,23 @@ def _col_x(line, needle):
     return report._width(line[: line.index(needle)])
 
 
-def _split_fixed(line, widths):
-    """按已知列宽把定宽表的一行切回各列，返回 (定宽列, 末尾自由列)。"""
-    cells, pos = [], 0
-    for w in widths:
-        seg, used = [], 0
-        while pos < len(line) and used < w:
-            used += report._width(line[pos])
-            seg.append(line[pos])
-            pos += 1
-        cells.append("".join(seg))
-        pos += 2
-    return cells, line[pos:]
-
-
 # 定宽表：把每行按列宽切回去，QQ 列必须正好落在同一位置，备注只能在最后
 _cut = [_split_fixed(l, report.DAY_WIDTHS) for l in _rows5[1:]]
 check("日榜定宽：昵称长短不改变 QQ 列位置",
       len(_cut) == 5 and all(c[2].strip().isdigit() for c, _ in _cut), _rows5)
-check("日榜达上限备注排在最后一列，不参与对齐",
-      all(t.strip() in ("", "（已抵达今日上限）") for _, t in _cut),
+check("日榜备注列只剩新人/拉新，不参与定宽对齐",
+      all(t.strip() == "" or t.startswith(("新人", "拉新")) for _, t in _cut),
+      [t for _, t in _cut])
+check("日榜备注给新人标出入群日期与邀请人来源",
+      next(t for c, t in _cut if c[2].strip() == "1001").startswith(
+          "新人12-05入群，邀请人未记到"),
       [t for _, t in _cut])
 check("日榜表头与数据行共用同一组列宽",
       _split_fixed(_rows5[0], report.DAY_WIDTHS)[0][2].strip() == "QQ", _rows5[0])
 check("月榜同分并列名次(1,2,2,2,5)",
       [l.split()[0] for l in lm.splitlines()[2:]] == ["1", "2", "2", "2", "5"], lm)
 check("月榜超长昵称仍等宽",
-      len({report._width(l) for l in lm.splitlines()[1:]}) == 1, lm)
+      len({_fixed_w(l, report.MONTH_WIDTHS) for l in lm.splitlines()[1:]}) == 1, lm)
 check("左对齐列贴住列首(修 _pad 只认 left 导致整列右移)",
       report._pad("abc", 10, "l").startswith("abc")
       and report._pad("abc", 10, "left").startswith("abc"))
@@ -830,6 +888,75 @@ pay5 = pathlib.Path(str(PLUGIN_DIR)) / "pay_list_2099-12.txt"
 if pay5.exists():
     pay5.unlink()
 conn5.close()
+
+# ================= DB5b: 榜单备注（新人 / 邀请人 / 拉新得分） =================
+print("== DB5b: board notes for newbies and inviters ==")
+p5b = make_db("db5b")
+conn5b = sqlite3.connect(p5b)
+for q, nm in ((3001, "新人甲"), (3002, "邀请人乙"), (3003, "审批人丙"), (3004, "新人丁")):
+    conn5b.execute("INSERT INTO user_info(qq, name) VALUES(?,?)", (q, nm))
+# 3001: 邀请人自己在窗口内发过 /新人绑定 → 已确认
+conn5b.execute(
+    "INSERT INTO join_log(qq, group_id, invited_by, join_date, invited_src, join_kind) "
+    "VALUES(3001,?,3002,'2099-12-03',2,'invite')", (GROUP,))
+conn5b.execute(
+    "INSERT INTO join_history(qq, group_id, join_date, invited_by) "
+    "VALUES(3001,?,'2099-12-03',3002)", (GROUP,))
+# 3004: 管理员审批入群，operator_id 是审批人不是拉他的人
+conn5b.execute(
+    "INSERT INTO join_log(qq, group_id, invited_by, join_date, invited_src, join_kind) "
+    "VALUES(3004,?,3003,'2099-12-10',1,'approve')", (GROUP,))
+conn5b.execute(
+    "INSERT INTO join_history(qq, group_id, join_date, invited_by) "
+    "VALUES(3004,?,'2099-12-10',3003)", (GROUP,))
+conn5b.execute(
+    "INSERT INTO newbie_bonus(newbie_qq, inviter_qq, awarded_month, bonus) "
+    "VALUES(3001,3002,'2099-12',10)")
+conn5b.execute(
+    "INSERT INTO month_score(qq, month, total, robux, settled) "
+    "VALUES(3002,'2099-12',6.0,50,1)")
+conn5b.execute(
+    "INSERT INTO month_score(qq, month, total, robux, settled) "
+    "VALUES(3001,'2099-12',2.0,0,1)")
+conn5b.execute(
+    "INSERT INTO month_score(qq, month, total, robux, settled) "
+    "VALUES(3004,'2099-12',1.0,0,1)")
+conn5b.execute("INSERT INTO daily_score VALUES(3002,'2099-12-03',6.0,60)")
+conn5b.execute("INSERT INTO daily_score VALUES(3001,'2099-12-03',2.0,20)")
+conn5b.execute("INSERT INTO daily_score VALUES(3004,'2099-12-10',1.0,10)")
+conn5b.commit()
+
+lm5b = report.render_month_board("2099-12", now=datetime.datetime(2100, 1, 15, 12, 0))
+check("已结算月榜有备注列", "备注" in lm5b.splitlines()[1], lm5b)
+check("已结算月榜标出已确认的邀请人",
+      "新人12-03入群，邀请人 邀请人乙(本人已确认)" in lm5b, lm5b)
+check("审批入群的不把审批人写成邀请人，只标待定",
+      "新人12-10入群，邀请人待定(管理员放行，绑上才算拉新)" in lm5b
+      and "审批人丙" not in lm5b, lm5b)
+check("已结算月榜把拉新得分备注在邀请人一行",
+      "拉新 +10（新人甲 达标）" in lm5b, lm5b)
+check("备注列不参与定宽对齐",
+      len({_fixed_w(l, report.MONTH_WIDTHS) for l in lm5b.splitlines()[1:]}) == 1, lm5b)
+
+conn5b.execute("UPDATE month_score SET settled=0 WHERE month='2099-12'")
+conn5b.commit()
+live5b = report.render_month_board("2099-12", now=datetime.datetime(2099, 12, 20, 12, 0))
+check("实时月榜同样带新人/邀请人备注",
+      "邀请人 邀请人乙(本人已确认)" in live5b and "备注" in live5b.splitlines()[1], live5b)
+check("备注只出现在有入群记录的人那一行",
+      sum("新人12-03入群" in l for l in live5b.splitlines()) == 1, live5b)
+
+day5b = report.render_day_board("2099-12-03", now=datetime.datetime(2099, 12, 5, 12, 0))
+check("日榜备注显示拉新得分", "拉新 +10（新人甲 达标）" in day5b, day5b)
+
+pf5b = report.render_profile(3001, None, "测试群", now=datetime.datetime(2099, 12, 20, 12, 0))
+check("/查询 单人档列出邀请关系与新人加成",
+      "邀请关系：邀请人 邀请人乙(本人已确认)" in pf5b
+      and "本月按新人计" in pf5b, pf5b)
+pf5b2 = report.render_profile(3002, None, "测试群", now=datetime.datetime(2099, 12, 20, 12, 0))
+check("/查询 邀请人一行显示本月拉新得分",
+      "本月拉新得分 拉新 +10（新人甲 达标）" in pf5b2, pf5b2)
+conn5b.close()
 
 # ================= DB6: 漏算补跑 / 月榜含未结算日 / 运维指令 =================
 print("== DB6: catchup, live month merge, admin ops ==")
@@ -1096,6 +1223,31 @@ check("回填后进未发言扣分名单",
 check("昵称同步到user_info",
       conn7.execute("SELECT name FROM user_info WHERE qq=3001").fetchone()[0] == "新人甲")
 
+# 入群时间精确到秒：NapCat 名单里的 join_time 不能只留到"日"，
+# 插件装之前就进群的人（2025 年进的）也要能显示成 2025 年那一分秒
+check("同步把 join_time 按秒存进 members",
+      conn7.execute("SELECT join_ts FROM members WHERE qq=3001").fetchone()[0] == JOIN_TS)
+check("回填的 join_log 一起带上秒级入群时刻",
+      conn7.execute("SELECT join_ts FROM join_log WHERE qq=3001").fetchone()[0] == JOIN_TS)
+check("没有 join_time 的成员不写脏时刻",
+      conn7.execute("SELECT join_ts FROM members WHERE qq=3002").fetchone()[0] == 0)
+conn7.execute("UPDATE join_log SET join_ts=0 WHERE qq=3001")
+conn7.commit()
+sched.set_context(Ctx([FakePlat(FakeBot(MEMBERS), "napcat")]))
+asyncio.run(sched.member_sync_job(SYNC1 + datetime.timedelta(minutes=30)))
+check("老记录缺的入群时刻由下一次同步补齐",
+      conn7.execute("SELECT join_ts FROM join_log WHERE qq=3001").fetchone()[0] == JOIN_TS)
+_pf7 = report.render_profile(3001, None, "测试群",
+                            now=datetime.datetime(2099, 11, 20, 12, 0))
+check("/查询 用库里的同步时刻，NapCat 不在线也精确到分钟",
+      "入群时间：2099-11-10 08:00（群成员同步）" in _pf7, _pf7)
+conn7.execute("UPDATE members SET join_ts=0 WHERE qq=3001")
+conn7.execute("UPDATE join_log SET join_ts=0 WHERE qq=3001")
+conn7.commit()
+check("只有日期时退回显示到日",
+      "入群时间：2099-11-10（只到日）" in report.render_profile(
+          3001, None, "测试群", now=datetime.datetime(2099, 11, 20, 12, 0)))
+
 # 第二次同步：3002 退群 → in_group=0 → 退出扣分名单，但保留历史
 sched.set_context(Ctx([FakePlat(FakeBot(MEMBERS[:1]))]))
 asyncio.run(sched.member_sync_job(SYNC1 + datetime.timedelta(hours=1)))
@@ -1325,6 +1477,215 @@ check("名单留空即不过滤(机器人也参与计分)",
       BOT in ds.valid_msg_counts(conn9, GROUP, "2099-11-20", 120, 2)
       and 4001 in ds.valid_msg_counts(conn9, GROUP, "2099-11-20", 120, 2))
 conn9.close()
+
+# ================= DB10: 邀请关系人工确认（/新人绑定 窗口） =================
+print("== DB10: inviter confirm window ==")
+p10 = make_db("db10")
+conn10 = sqlite3.connect(p10)
+_CFG10 = {
+    **_CFG_BASE, "db_path": p10, "group_id": str(GROUP),
+    "invite_bind": {"enabled": True, "window_minutes": 5, "prompt": True},
+}
+set_plugin_config(_CFG10)
+for q, nm in ((5001, "邀请人一"), (5002, "被绑新人"), (5005, "真正拉人的"),
+              (5009, "审批管理员")):
+    conn10.execute("INSERT INTO user_info(qq, name) VALUES(?,?)", (q, nm))
+conn10.commit()
+
+T10 = int(datetime.datetime(2099, 12, 1, 10, 0).timestamp())
+
+
+def _join10(newbie, oper, kind, at):
+    raw = {"post_type": "notice", "notice_type": "group_increase",
+           "group_id": GROUP, "user_id": newbie, "operator_id": oper,
+           "sub_type": kind}
+    return asyncio.run(
+        mh.handle_group_join(FakeEvent(newbie, "", raw=raw), _now=at)
+    )
+
+
+def _jl(qq):
+    return conn10.execute(
+        "SELECT COALESCE(invited_by,0), COALESCE(invited_src,0), "
+        "COALESCE(join_kind,'') FROM join_log WHERE qq=?", (qq,)
+    ).fetchone()
+
+
+def _pb(qq):
+    return conn10.execute(
+        "SELECT COALESCE(detected_inviter,0), join_ts, COALESCE(bound_ts,0) "
+        "FROM pending_bind WHERE newbie_qq=?", (qq,)
+    ).fetchone()
+
+
+pr = _join10(5002, 5001, "invite", T10)
+check("入群事件开出待确认窗口并记下检测到的邀请人",
+      _pb(5002) == (5001, T10, 0) and _jl(5002) == (5001, 1, "invite"),
+      (_pb(5002), _jl(5002)))
+check("开了群内提示才回一份要问谁的话",
+      pr == {"newbie": 5002, "inviter": 5001, "approve": False}, pr)
+ok10 = admin_ops.bind_inviter(5002, 5001, _now=T10 + 60)
+check("邀请人绑定成功并标成人工确认",
+      "绑定成功" in ok10 and "人工确认" in ok10 and _jl(5002)[1] == 2, ok10)
+check("绑定后带昵称回显，窗口标记已结掉",
+      "被绑新人(5002) 的邀请人 = 邀请人一(5001)" in ok10 and _pb(5002)[2] == T10 + 60,
+      (ok10, _pb(5002)))
+again = admin_ops.bind_inviter(5002, 5001, _now=T10 + 90)
+check("重复绑定被挡掉", "已在" in again and "不再重复绑定" in again, again)
+
+_join10(5003, 5001, "invite", T10)
+late = admin_ops.bind_inviter(5003, 5001, _now=T10 + 5 * 60 + 1)
+check("超出窗口不再受理，自动检测的结果保留",
+      "超时" in late and _jl(5003) == (5001, 1, "invite"), (late, _jl(5003)))
+
+_join10(5004, 5009, "approve", T10)
+check("审批入群：流水里留着谁放行的，但窗口里当成没检测到邀请人",
+      _jl(5004) == (5009, 1, "approve") and _pb(5004) == (0, T10, 0),
+      (_jl(5004), _pb(5004)))
+check("审批入群的群内提示不点名审批人，只喊拉他的人来自认",
+      _join10(5015, 5009, "approve", T10) == {
+          "newbie": 5015, "inviter": 5009, "approve": True})
+rebind = admin_ops.bind_inviter(5004, 5005, _now=T10 + 30)
+check("审批入群没有真邀请人，真正拉人的来绑就认",
+      "绑定成功" in rebind and "管理员不算邀请人" in rebind and _jl(5004)[0] == 5005,
+      (rebind, _jl(5004)))
+check("绑定回复里说清之前放行的是谁",
+      "放行他的管理员 审批管理员(5009)" in rebind and "真正拉人的(5005)" in rebind, rebind)
+_jh4 = conn10.execute(
+    "SELECT invited_by FROM join_history WHERE qq=5004 ORDER BY id DESC LIMIT 1"
+).fetchone()[0]
+check("绑定同时更新入群流水，拉新奖励按新邀请人发", _jh4 == 5005, _jh4)
+_join10(5014, 5001, "invite", T10)
+grab = admin_ops.bind_inviter(5014, 5005, _now=T10 + 20)
+check("自动检测到了邀请人就不许别人改绑，检测结果原样保留",
+      "不接受改绑" in grab and _jl(5014) == (5001, 1, "invite")
+      and _pb(5014)[2] == 0, (grab, _jl(5014)))
+check("挡抢绑时告诉对方该谁自己来发",
+      "邀请人一(5001) 本人发 /新人绑定 5014" in grab, grab)
+decl = admin_ops.bind_inviter(5014, 5005, _now=T10 + 40, declared=True)
+check("管理员在后台代填能覆盖自动检测，来源标成代填",
+      "绑定成功" in decl and "覆盖了自动检测到的 邀请人一(5001)" in decl
+      and _jl(5014) == (5005, 3, "invite"), (decl, _jl(5014)))
+selfh = admin_ops.bind_inviter(5002, 5002, _now=T10 + 10)
+check("不能把自己绑成自己的邀请人", "自己" in selfh, selfh)
+norp = admin_ops.bind_inviter(9999, 5001, _now=T10 + 10)
+check("库里没这个人时直说绑不了", "没有 9999 的入群记录" in norp, norp)
+conn10.execute("DELETE FROM pending_bind WHERE newbie_qq=5003")
+conn10.commit()
+nopb = admin_ops.bind_inviter(5003, 5001, _now=T10 + 10)
+check("入群那会儿插件不在线时解释为什么没有窗口",
+      "插件不在线" in nopb and "没有待确认窗口" in nopb, nopb)
+
+_join10(5012, 0, "link", T10)
+linkb = admin_ops.bind_inviter(5012, 5013, _now=T10 + 20)
+check("链接/二维码入群也开窗口，谁认领记在谁头上",
+      "绑定成功" in linkb and "没检测到邀请人" in linkb and _jl(5012)[0] == 5013,
+      (linkb, _jl(5012)))
+check("认领后来源标成人工确认，备注不再写无邀请人", _jl(5012)[1] == 2, _jl(5012))
+
+_join10(5006, 5001, "invite", T10)
+_join10(5006, 5001, "invite", T10 + 700)  # 退了又进: 窗口重开
+back = admin_ops.bind_inviter(5006, 5001, _now=T10 + 720)
+check("退了又进的人没有邀请奖励，绑定也挡掉", "退了又进" in back, back)
+check("重开窗口把 bound_ts 归零", _pb(5006)[2] == 0, _pb(5006))
+
+set_plugin_config({**_CFG10, "no_score_qqs": str(5001)})
+bots = admin_ops.bind_inviter(5007, 5001, _now=T10 + 10)
+check("不计分名单里的号（群内机器人）不接受绑定", "不计分名单" in bots, bots)
+set_plugin_config(_CFG10)
+
+conn10.execute(
+    "INSERT INTO pending_bind(newbie_qq, group_id, detected_inviter, join_ts, bound_ts) "
+    "VALUES(7777,?,5001,?,0)", (GROUP, T10 - 90000))
+conn10.commit()
+_join10(5008, 5001, "invite", T10)
+check("一天前没绑上的旧窗口随下一次入群清掉",
+      conn10.execute("SELECT COUNT(*) FROM pending_bind WHERE newbie_qq=7777")
+      .fetchone()[0] == 0)
+set_plugin_config({**_CFG10, "invite_bind": {"prompt": False}})
+check("群内提示默认不开时不返回任何要说的话",
+      _join10(5010, 5001, "invite", T10) is None)
+set_plugin_config({**_CFG10, "invite_bind": {"enabled": False}})
+off10 = admin_ops.bind_inviter(5011, 5001, _now=T10 + 10)
+check("关掉后指令直接说未启用，不碰库", "未启用" in off10 and _pb(5011) is None, off10)
+set_plugin_config(_CFG10)
+
+check("备注只写邀请人是谁，不解释入群方式",
+      report._inviter_text(5001, 2, "invite", {}) == "邀请人 5001(本人已确认)"
+      and report._inviter_text(5001, 1, "invite", {}) == "邀请人 5001(未确认)"
+      and report._inviter_text(5003, 1, "approve", {})
+      == "邀请人待定(管理员放行，绑上才算拉新)"
+      and report._inviter_text(0, 0, "approve", {})
+      == "邀请人待定(管理员放行，绑上才算拉新)"
+      and report._inviter_text(0, 0, "link", {}) == "自己搜群号入群，无邀请人"
+      and report._inviter_text(5001, 3, "invite", {}) == "邀请人 5001(管理员代填)"
+      and "未记到" in report._inviter_text(0, 0, "", {}))
+check("参数不是一条 QQ 时只回用法",
+      admin_ops.plan_bind("")[2].startswith("用法")
+      and admin_ops.plan_bind("abc")[0] is None
+      and admin_ops.plan_bind("123")[0] is None
+      and admin_ops.plan_bind("123456789。")[0] == 123456789
+      and admin_ops.plan_bind("123456789")[1] == 0)
+check("后台的写法多带一个邀请人QQ，第二个参数写坏时整条不受理",
+      admin_ops.plan_bind("123456789 987654321") == (123456789, 987654321, "")
+      and admin_ops.plan_bind("123456789 abc")[0] is None
+      and admin_ops.plan_bind("123456789 99")[0] is None)
+class _Cmd10(FakeEvent):
+    """带平台名的假事件：QQ 群与 AstrBot 后台两条路径分开走一遍。"""
+
+    def __init__(self, uid, text, platform):
+        super().__init__(uid, text)
+        self._platform = platform
+
+    def get_platform_name(self):
+        return self._platform
+
+    def plain_result(self, text):
+        return ("plain", text)
+
+
+def _bind_out(uid, text, platform):
+    async def run():
+        return [r async for r in bot.cmd_bind_inviter(_Cmd10(uid, text, platform))]
+    return asyncio.run(run())
+
+
+_join10(60001, 5001, "invite", int(time.time()) - 60)
+check("群里抢注别人拉的新人：不出声，也不改库",
+      _bind_out(5005, "/新人绑定 60001", "aiocqhttp") == []
+      and _jl(60001) == (5001, 1, "invite") and _pb(60001)[2] == 0, _jl(60001))
+check("群里多带一个 QQ 也不算管理员代填，照样只是抢绑",
+      _bind_out(5005, "/新人绑定 60001 60003", "aiocqhttp") == []
+      and _jl(60001) == (5001, 1, "invite"), _jl(60001))
+_one = _bind_out(5005, "/新人绑定 60001", "webchat")
+check("后台只写新人QQ时不受理，让它补上邀请人QQ",
+      len(_one) == 1 and "邀请人QQ" in _one[0][1] and _jl(60001)[1] == 1, _one)
+_two = _bind_out(5005, "/新人绑定 60001 60003", "webchat")
+check("后台两个参数=管理员代填，能覆盖自动检测并标成代填",
+      len(_two) == 1 and "绑定成功" in _two[0][1] and "管理员代填" in _two[0][1]
+      and _jl(60001) == (60003, 3, "invite"), _two)
+_join10(60002, 5009, "approve", int(time.time()) - 60)
+check("审批入群没有真邀请人，本人在群里来绑照样认",
+      _bind_out(5005, "/新人绑定 60002", "aiocqhttp") == []
+      and _jl(60002) == (5005, 2, "approve"), _jl(60002))
+check("群里参数写错也不出声", _bind_out(5005, "/新人绑定 abc", "aiocqhttp") == [])
+diag10 = report.render_diag(now=datetime.datetime(2099, 12, 1, 12, 0))
+check("自检列出待确认窗口与已人工确认人数",
+      "待确认" in diag10 and "人工确认" in diag10 and "邀请确认窗口" in diag10, diag10)
+bind_src = pathlib.Path(HERE, "main.py").read_text("utf-8")
+check("新人绑定是群内指令(不加仅后台闸门)",
+      "cmd_bind_inviter" in bind_src and "新人绑定" in bind_src)
+_bind_seg = bind_src.split("async def cmd_bind_inviter")[1].split("@filter.command")[0]
+check("群里的绑定结果只写日志，不回话",
+      "webchat = _is_webchat(event)" in _bind_seg
+      and _bind_seg.index("if webchat:") < _bind_seg.index("plain_result")
+      and "logger.info" in _bind_seg[_bind_seg.index("plain_result"):], _bind_seg)
+check("只有后台那条路径是管理员代填，群里发的一律按本人自证",
+      _bind_seg.index("declared=True") < _bind_seg.index("admin_ops.bind_inviter(newbie, binder)"),
+      _bind_seg)
+check("WebUI 里发绑定仍然回全文(便于管理员测试)",
+      "yield event.plain_result(text)" in _bind_seg, _bind_seg)
+conn10.close()
 
 # 汇总
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")

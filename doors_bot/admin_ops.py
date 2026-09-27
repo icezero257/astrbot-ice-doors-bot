@@ -1,6 +1,7 @@
 """
-doors_bot - 后台管理操作（改数据，仅供 WebUI 指令调用）
+doors_bot - 后台管理操作（所有写数据的动作集中在这里）
 
+除 `新人绑定` 由邀请人在群里触发外，其余都只从 WebUI 指令调用。
 所有写操作都遵守同一口径:
 - 重置 = 按 msg 原始发言记录重算，不是清空（分数会回来，去重/窗口规则变了也会跟着变）
 - 删除数据前先读出被删行并回显，便于误操作后手工回填
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 import datetime
 import sqlite3
+import time
 
 from .daily_score import calc_day
 from .monthly_settle import get_month_range, settle
@@ -18,6 +20,7 @@ from .runtime_config import (
     get_daily_config,
     get_db_path,
     get_group_id,
+    get_invite_bind_config,
     get_monthly_config,
     get_no_score_qqs,
 )
@@ -473,6 +476,164 @@ def deduct_score(
         + (f"，原因: {reason}" if reason else "")
         + "\n注: 当日/当月榜单是实时算的，日榜不会变，月榜与下次结算才会体现。"
     )
+
+
+BIND_CMD = "新人绑定"
+
+
+def _nick(c: sqlite3.Cursor, qq: int) -> str:
+    row = c.execute("SELECT name FROM user_info WHERE qq=?", (int(qq),)).fetchone()
+    return f"{row[0]}({qq})" if row and row[0] else str(qq)
+
+
+def bind_inviter(newbie_qq: int, binder_qq: int, _now: int | None = None,
+                 declared: bool = False) -> str:
+    """邀请人认领自己拉进来的新人：把入群事件开的那条确认窗口结掉。
+
+    窗口只由入群事件写（要精确到秒的时刻才算时限），所以插件没在线时进的人
+    绑不了，只能等成员同步回填入群日期。
+
+    群里的 /新人绑定 只有新人 QQ 一个参数，绑定者就是发送者本人（自证）；
+    后台聊天窗的发送者不是 QQ 号，要多带一个邀请人 QQ 由管理员代填（declared）。
+
+    自动检测与人工绑定各管一半，互不翻案：
+    - 检测到了邀请人 → 以检测为准，别人再来绑（想把这个新人算到自己头上刷分）一律挡掉，
+      同一个人再发一次只算"人工确认"；
+    - 没检测到（审批放行、搜群号自己进来、入群那会儿插件不在线）→ 谁来绑就记在谁头上。
+    """
+    cfg = get_invite_bind_config()
+    if not cfg["enabled"]:
+        return f"{BIND_CMD} 未启用: 配置页 邀请确认窗口 里关掉了指令。"
+
+    now = int(_now if _now is not None else time.time())
+    conn = sqlite3.connect(get_db_path())
+    try:
+        c = conn.cursor()
+        if int(binder_qq) in get_no_score_qqs():
+            return f"{_nick(c, binder_qq)} 在不计分名单里（群内机器人），不接受绑定。"
+        if int(binder_qq) == int(newbie_qq):
+            return "不能把自己绑成自己的邀请人。"
+
+        row = c.execute(
+            "SELECT COALESCE(detected_inviter,0), join_ts, "
+            "COALESCE(bound_ts,0) FROM pending_bind WHERE newbie_qq=?",
+            (int(newbie_qq),),
+        ).fetchone()
+        known = c.execute(
+            "SELECT COALESCE(invited_by,0), COALESCE(join_kind,''), join_date "
+            "FROM join_log WHERE qq=?",
+            (int(newbie_qq),),
+        ).fetchone()
+        if known is None:
+            return f"库里没有 {newbie_qq} 的入群记录，绑不了。"
+        approver, kind, join_date = int(known[0]), str(known[1]), known[2]
+        if not row:
+            return (
+                f"{_nick(c, newbie_qq)} 的入群记录是 {join_date}"
+                f"（邀请人{'已记为 ' + str(approver) if approver else '未记到'}），"
+                "但没有待确认窗口——入群那一刻插件不在线，这种情况只能靠自动检测。"
+            )
+        detected, join_ts, bound = row if row else (0, 0, 0)
+        binder = int(binder_qq)
+        if row and detected and detected != binder and kind != "approve" \
+                and not declared:
+            return (
+                f"入群事件已经检测到是 {_nick(c, detected)} 把 "
+                f"{_nick(c, newbie_qq)} 拉进来的，不接受改绑到别人名下。\n"
+                f"确实是你拉的就请 {_nick(c, detected)} 本人发 "
+                f"/{BIND_CMD} {int(newbie_qq)}；这条绑定没有生效。"
+            )
+        if row and bound:
+            return (
+                f"{_nick(c, newbie_qq)} 已在 "
+                f"{datetime.datetime.fromtimestamp(bound):%m-%d %H:%M} 绑到 "
+                f"{_nick(c, approver or detected)} 名下，不再重复绑定。"
+            )
+        left = cfg["window_minutes"] * 60 - (now - join_ts) if row else 0
+        if row and left < 0:
+            return (
+                f"超时: {_nick(c, newbie_qq)} 的入群事件发生在 "
+                f"{datetime.datetime.fromtimestamp(join_ts):%m-%d %H:%M}，"
+                f"{cfg['window_minutes']} 分钟窗口已过。"
+                + (
+                    f"邀请人仍按自动检测的 {_nick(c, detected)} 记。"
+                    if detected
+                    else "没有自动检测到邀请人。"
+                )
+            )
+        if not row and not declared:
+            # 入群那一刻插件不在线，开不出窗口（窗口要有精确到秒的时刻才算时限）；
+            # 群里自证的绑法在这种情况下不受理，免得拿个老成员随意认领。
+            return (
+                f"{_nick(c, newbie_qq)} 的入群记录是 {join_date}，"
+                f"邀请人{'已记为 ' + str(detected or approver) if (detected or approver) else '未记到'}，"
+                "但没有待确认窗口（入群那一刻插件不在线）。\n"
+                f"这种情况要管理员在后台代填：/{BIND_CMD} {int(newbie_qq)} <邀请人QQ>"
+            )
+        if c.execute(
+            "SELECT COUNT(*) FROM join_history WHERE qq=?", (int(newbie_qq),)
+        ).fetchone()[0] >= 2:
+            return f"{_nick(c, newbie_qq)} 退了又进，不是新人，没有邀请奖励。"
+
+        c.execute(
+            "UPDATE join_log SET invited_by=?, invited_src=? WHERE qq=?",
+            (binder, 3 if declared else 2, int(newbie_qq)),
+        )
+        c.execute(
+            "UPDATE join_history SET invited_by=? WHERE rowid=(SELECT rowid FROM "
+            "join_history WHERE qq=? ORDER BY id DESC LIMIT 1)",
+            (binder, int(newbie_qq)),
+        )
+        if row:
+            c.execute(
+                "UPDATE pending_bind SET bound_ts=? WHERE newbie_qq=?",
+                (now, int(newbie_qq)),
+            )
+        conn.commit()
+        if not row:
+            tail = "（入群那一刻插件不在线，这条由后台补记）"
+        elif kind == "approve" and approver and approver != binder:
+            tail = (
+                f"（入群那一刻只拿得到放行他的管理员 {_nick(c, approver)}，"
+                "管理员不算邀请人、也不给他计拉新分；现在按你确认的这个人记）"
+            )
+        elif declared and detected and detected != binder:
+            tail = f"（管理员代填，覆盖了自动检测到的 {_nick(c, detected)}）"
+        elif not detected:
+            tail = "（入群事件没检测到邀请人，这条以本次绑定为准）"
+        else:
+            tail = "（与入群事件检测到的一致，视为人工确认）"
+        head = f"绑定成功: {_nick(c, newbie_qq)} 的邀请人 = {_nick(c, binder)}{tail}"
+        if declared:
+            head += "（管理员代填，不是邀请人本人自证）"
+        if not row:
+            return head + "\n新人观察期满后按拉新规则给邀请人加分。"
+        return (
+            f"{head}\n窗口还剩 {max(0, left // 60)} 分 {left % 60} 秒，已结掉；"
+            "新人观察期满后按拉新规则给邀请人加分。"
+        )
+    finally:
+        conn.close()
+
+
+def plan_bind(newbie_raw: str) -> tuple[int | None, int, str]:
+    """把 `新人绑定` 的参数解析成 (新人QQ, 邀请人QQ, 提示)。
+
+    第二个参数只有后台用得上：群里发这条时绑定者就是发送者本人，第二个参数一律忽略。
+    """
+    parts = (newbie_raw or "").strip().split()
+    newbie = parts[0].rstrip("。.!！") if parts else ""
+    inviter = parts[1].rstrip("。.!！") if len(parts) > 1 else ""
+    if not newbie.isdigit() or len(newbie) < 5:
+        return None, 0, (
+            f"用法: /{BIND_CMD} <新人QQ号>（群里由邀请人本人发）\n"
+            f"      /{BIND_CMD} <新人QQ号> <邀请人QQ号>（后台由管理员代填）"
+        )
+    if inviter and (not inviter.isdigit() or len(inviter) < 5):
+        return None, 0, (
+            f"第二个参数要填邀请人的 QQ 号，例: /{BIND_CMD} {newbie} 123456789"
+        )
+    return int(newbie), int(inviter) if inviter else 0, ""
 
 
 def plan_sync() -> str:

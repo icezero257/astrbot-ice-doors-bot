@@ -1,0 +1,213 @@
+{
+  "group_id": {
+    "description": "目标QQ群号",
+    "type": "string",
+    "hint": "只统计该群的发言，留空则不统计任何群（日志与 /自检 会提示未配置）",
+    "default": ""
+  },
+  "no_score_qqs": {
+    "description": "不会被计分的QQ用户",
+    "type": "string",
+    "hint": "多个QQ用英文逗号分隔，例如 100000001,100000002；群里的机器人号、公告号填在这里：发言完全不入库，既不加分也不会被扣未发言分，不会出现在榜单上。注意他们的话也不再算作\"120秒内有他人接话\"的佐证。留空=不排除任何人。",
+    "default": ""
+  },
+  "db_path": {
+    "description": "SQLite数据库路径",
+    "type": "string",
+    "hint": "留空=自动使用 data/plugins/doors_bot_data/doors.db（与插件目录同级但在其之外，删插件/更新插件不会丢数据）。填绝对路径按填写位置使用；填相对文件名则放到该数据目录下。不要把路径填进 doors_bot 插件目录内部。",
+    "default": ""
+  },
+  "daily_score": {
+    "description": "每日计分规则",
+    "type": "object",
+    "items": {
+      "per_msg_score": {
+        "description": "每条有效发言得分",
+        "type": "float",
+        "default": 0.05
+      },
+      "daily_cap": {
+        "description": "单日发言分封顶（不含奖励分）",
+        "type": "float",
+        "default": 3.0
+      },
+      "bonus_threshold": {
+        "description": "触发奖励分所需有效句数",
+        "type": "int",
+        "default": 10
+      },
+      "bonus_score": {
+        "description": "满句奖励分",
+        "type": "float",
+        "default": 1.0
+      },
+      "penalty": {
+        "description": "当日未有效发言扣分（绝对值）",
+        "type": "float",
+        "default": 0.2
+      },
+      "dedup_seconds": {
+        "description": "同人发言去重秒数",
+        "type": "int",
+        "hint": "该秒数内同一人的多条消息只记1条",
+        "default": 5
+      },
+      "turn_gap_seconds": {
+        "description": "连发轮次合并间隔（秒）",
+        "type": "int",
+        "hint": "同一人连发且中间无他人插话时，该间隔内的所有消息合并算1条；有他人插话则恢复正常逐条计数",
+        "default": 60
+      },
+      "content_dedup": {
+        "description": "相同内容去重",
+        "type": "bool",
+        "hint": "内容与该人上一条完全相同的消息不计（防复读刷屏）",
+        "default": true
+      },
+      "meaningless_filter": {
+        "description": "无意义短消息过滤",
+        "type": "bool",
+        "hint": "单字符或纯数字消息不计（防 1/2/3 接龙刷屏）",
+        "default": true
+      },
+      "multi_speaker_window_seconds": {
+        "description": "多人说话判定时间窗（秒）",
+        "type": "int",
+        "hint": "消息前后该窗口内需有足够人数说话才计有效发言",
+        "default": 120
+      },
+      "multi_speaker_min_count": {
+        "description": "计分所需窗口内最少不同发言人数（含本人）",
+        "type": "int",
+        "hint": "2 = 120秒内至少2人在说话",
+        "default": 2
+      }
+    }
+  },
+  "monthly_settle": {
+    "description": "月度结算设置",
+    "type": "object",
+    "items": {
+      "top_n": {
+        "description": "获奖前N名",
+        "type": "int",
+        "default": 10
+      },
+      "award_per_top": {
+        "description": "每个名额奖励Robux",
+        "type": "int",
+        "hint": "奖金池 = 名额数 × 本数（默认 10×50=500R），总额永不超过奖金池。前N名含并列：并列的那组装得下剩余名额就每人各拿一份，装不下就整组平分该组占掉的剩余名额（如第7名起7人并列 → 平分第7~10名那 200R，每人 28.57R，零头向下取到2位小数留在池子里）",
+        "default": 50
+      },
+      "newbie_multiplier": {
+        "description": "新人积分倍率（入群当月及次月）",
+        "type": "float",
+        "default": 1.1
+      },
+      "decay_rate": {
+        "description": "连续获奖衰减率",
+        "type": "float",
+        "hint": "连续n月获奖，下月总分×(1-decay_rate×n)，最低到0",
+        "default": 0.5
+      },
+      "carry_over": {
+        "description": "未获奖积分结转比例",
+        "type": "float",
+        "default": 0.05
+      }
+    }
+  },
+  "invite_bonus": {
+    "description": "新人邀请奖励（可选功能）",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用邀请奖励",
+        "type": "bool",
+        "hint": "规则：新人入群后窗口天数内，每日有效发言均超过门槛，或日均达到门槛，邀请人加分",
+        "default": true
+      },
+      "window_days": {
+        "description": "观察窗口天数（自入群日起）",
+        "type": "int",
+        "default": 10
+      },
+      "daily_min_msgs": {
+        "description": "每日有效发言门槛（严格大于该值才算达标）",
+        "type": "int",
+        "default": 10
+      },
+      "avg_daily_msgs": {
+        "description": "日均有效发言门槛（达到即达标）",
+        "type": "int",
+        "default": 20
+      },
+      "bonus": {
+        "description": "邀请人奖励积分",
+        "type": "int",
+        "default": 10
+      }
+    }
+  },
+  "report": {
+    "description": "后台查榜指令（仅 AstrBot WebUI 聊天窗可用，QQ 内不响应）",
+    "type": "object",
+    "items": {
+      "display_limit": {
+        "description": "榜单最多显示条数（0=不限量，完整显示）",
+        "type": "int",
+        "hint": "0 或负数表示不限量。榜单一律不显示 0 分的行。查看：/日榜 [日期] /昨日榜 /月榜 [月份] /上月榜 /自检 /查询 <QQ>（/日榜 不带参数=当天实时，/查询 出一个人在本插件的发言档与入群时间）；运维需二次确认：/重置日 /重置月 /删除 /扣除 /结算 /补跑 /同步，末尾加 确认 才执行",
+        "default": 0
+      }
+    }
+  },
+  "scheduler": {
+    "description": "定时任务",
+    "type": "object",
+    "items": {
+      "daily_job_hour": {
+        "description": "每日计分小时（0-23）",
+        "type": "int",
+        "default": 23
+      },
+      "daily_job_minute": {
+        "description": "每日计分分钟（0-59）",
+        "type": "int",
+        "default": 59
+      },
+      "monthly_job_day": {
+        "description": "月度结算日期（每月第几号）",
+        "type": "int",
+        "default": 1
+      },
+      "monthly_job_hour": {
+        "description": "月度结算小时（0-23）",
+        "type": "int",
+        "default": 9
+      },
+      "monthly_job_minute": {
+        "description": "月度结算分钟（0-59）",
+        "type": "int",
+        "default": 0
+      },
+      "member_sync_minutes": {
+        "description": "群成员名单同步间隔（分钟）",
+        "type": "int",
+        "hint": "通过 NapCat 拉取全群成员及入群时间，用于未发言扣分名单与新人判定。启动时 NapCat 常还没连上，插件会按 2/5/10/20/40/80/160 秒退避重试；也可用 /同步 立刻手动拉一次",
+        "default": 60
+      },
+      "catchup_minutes": {
+        "description": "漏算补跑间隔（分钟）",
+        "type": "int",
+        "hint": "机器关机或 AstrBot 没在 23:59 运行时会漏掉整天。补跑只处理“有发言记录但没有日分”的已过日期，不会给整天离线的人补扣分",
+        "default": 30
+      },
+      "timezone": {
+        "description": "定时任务时区",
+        "type": "string",
+        "hint": "例如 Asia/Shanghai。留空跟随系统本地时区；改完需重启 AstrBot 生效",
+        "default": ""
+      }
+    }
+  }
+}

@@ -7,7 +7,7 @@ desc: >-
   群里邀请人本人认领自己拉进来的新人（不回话，只写库、写日志），后台由管理员
   带邀请人QQ代填，结果看日榜月榜的备注列。
 short_desc: QQ 群活跃统计 + Robux 月结，群内静默、榜单在后台看
-version: v2.5.5
+version: v2.5.6
 author: 冰凌不是冰凌
 repo: ""
 astrbot_version: ">=4.24.0"

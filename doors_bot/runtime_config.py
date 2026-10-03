@@ -214,14 +214,13 @@ def get_invite_bind_config() -> dict[str, Any]:
     """新人邀请关系的人工确认窗口。
 
     enabled=False 时只保留入群事件自动记的那份，`新人绑定` 指令不生效。
-    prompt=False 时插件在群里依然一个字都不发（默认），邀请人需要自己知道有这条指令；
-    打开后新人进群会在群里 @邀请人 催一次。
+    插件在群里永远一个字都不发（旧版那个"进群时催一句"的 prompt 开关已整个去掉，
+    配置里残留的这个键会被忽略），邀请人从群公告知道有这条指令。
     """
     section = _section("invite_bind")
     return {
         "enabled": _to_bool(section.get("enabled"), True),
         "window_minutes": max(1, _to_int(section.get("window_minutes"), 5)),
-        "prompt": _to_bool(section.get("prompt"), False),
     }
 
 

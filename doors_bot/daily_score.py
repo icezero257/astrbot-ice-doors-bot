@@ -8,7 +8,8 @@ doors_bot - 每日计分
 - 有效发言 = 纯文本 + 5秒去重(入库时) + 前后 window 秒内不同发言人数 >= min_count
   (窗口判定在计分/查榜时进行，可追溯：第二人开口后第一人窗内消息也计分)
 - 邀请奖励(可选): 新人入群起 window_days 天内每日有效发言均 > daily_min_msgs，
-  或日均 >= avg_daily_msgs → 邀请人 +bonus 分（计入当月 month_score.bonus）
+  或日均 >= avg_daily_msgs → 邀请人 +bonus 分，记在**新人入群那个月**的 month_score.bonus
+  （那个月已经结算完就退到当前月，否则这笔分只进榜、换不来 Robux）
 
 用法:
   python -m doors_bot.daily_score            # 计算今天
@@ -146,7 +147,11 @@ def check_invite_bonus(
     monthly_cfg: dict,
     daily_cfg: dict,
 ) -> int:
-    """评估邀请奖励: 入群满 window_days 天的新人。返回本次发奖人数。"""
+    """评估邀请奖励: 入群满 window_days 天的新人。返回本次发奖人数。
+
+    观察期满的那天才算得完"每天都达标/日均达标"，所以奖励就是那晚入账（再早也没有
+    完整数据）；入账月份取新人入群的那个月，见下面 awarded_month 的注释。
+    """
     if not monthly_cfg.get("invite_enabled", True):
         return 0
 
@@ -203,7 +208,16 @@ def check_invite_bonus(
         if not (cond_a or cond_b):
             continue
 
-        awarded_month = today[:7]
+        # 这笔分记到新人入群的那个月（谁在几月拉的人就算在几月的账上），而不是
+        # 观察期满的那天所在的下个月。入群月已经封账就退到当前月——已结算的月份
+        # total/robux 都定死了，再往里加分只改榜单、换不来钱。
+        awarded_month = join.strftime("%Y-%m")
+        closed = conn.execute(
+            "SELECT 1 FROM month_score WHERE month=? AND settled=1 LIMIT 1",
+            (awarded_month,),
+        ).fetchone()
+        if closed:
+            awarded_month = today[:7]
         try:
             conn.execute(
                 """
@@ -236,6 +250,7 @@ def check_invite_bonus(
         print(
             f"[daily_score] 邀请奖励: 新人{newbie_qq} 达标，"
             f"邀请人{inviter_qq} +{bonus}分 ({awarded_month})"
+            + ("；入群月已结算，改记当前月" if closed else "")
         )
 
     conn.commit()

@@ -311,8 +311,10 @@ async def db1():
     jb = conn1.execute("SELECT invited_by FROM join_log WHERE qq=102").fetchone()
     check("入群记录含邀请人", jb and jb[0] == 201, jb)
 
+    # 入群那一刻是真实时间，所以"当月新人"只能按运行当天的月份判，写死月份会在跨天时报错
+    this_month = datetime.date.today().strftime("%Y-%m")
     c1 = conn1.cursor()
-    check("首进者算新人", ms.is_newbie(102, "2026-09", c1))
+    check("首进者算新人", ms.is_newbie(102, this_month, c1))
 
     raw2 = dict(raw)
     await mh.handle_group_join(FakeEvent(102, "", raw=raw2))
@@ -320,7 +322,7 @@ async def db1():
         "SELECT COUNT(*) FROM join_history WHERE qq=102"
     ).fetchone()[0]
     check("退了又进记第2条流水", h == 2, h)
-    check("回流者永久失去新人资格", not ms.is_newbie(102, "2026-09", c1))
+    check("回流者永久失去新人资格", not ms.is_newbie(102, this_month, c1))
 
     # 主动入群(群号/二维码): operator_id 就是本人，不能算自己邀请自己
     raw_self = {"post_type": "notice", "notice_type": "group_increase",
@@ -341,7 +343,7 @@ async def db1():
     c1 = conn1.cursor()
     check(
         "上线前老成员重进不算新人",
-        not ms.is_newbie(900, "2026-09", c1)
+        not ms.is_newbie(900, this_month, c1)
         and conn1.execute(
             "SELECT COUNT(*) FROM join_history WHERE qq=900"
         ).fetchone()[0] == 2,
@@ -448,6 +450,68 @@ n = conn2.execute(
 check("邀请奖励不重复发", n == 1 and dict(
     conn2.execute("SELECT qq, bonus FROM month_score WHERE month='2099-12'").fetchall()
 ).get(201) == 10, n)
+
+
+# ---- 拉新分记到哪个月：满期那天在下一月，账仍要记回入群那月 ----
+def _days_from(start: datetime.date, count: int):
+    return [start + datetime.timedelta(days=i) for i in range(count)]
+
+
+def _seed_newbie(qq, inv, join_day):
+    conn2.execute(
+        "INSERT INTO join_log(qq, group_id, invited_by, join_date) VALUES(?,?,?,?)",
+        (qq, GROUP, inv, join_day.strftime("%Y-%m-%d")),
+    )
+    conn2.execute(
+        "INSERT INTO join_history(qq, group_id, join_date, invited_by) VALUES(?,?,?,?)",
+        (qq, GROUP, join_day, inv),
+    )
+    for d in _days_from(join_day, 10):
+        base = int(datetime.datetime(d.year, d.month, d.day, 12, 0).timestamp())
+        for i in range(11):
+            add_msg(conn2, qq, d.strftime("%Y-%m-%d"), base + i * 10)
+            add_msg(conn2, 999, d.strftime("%Y-%m-%d"), base + i * 10 + 5)
+
+
+def _awarded_month(qq):
+    row = conn2.execute(
+        "SELECT awarded_month FROM newbie_bonus WHERE newbie_qq=?", (qq,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+_seed_newbie(111, 211, datetime.date(2099, 12, 25))
+conn2.commit()
+ds.calc_day("2100-01-02", DCFG, MCfg, GROUP, set())
+check("观察期没满不发分（12-25 入群满期在 1-03）",
+      _awarded_month(111) is None, _awarded_month(111))
+ds.calc_day("2100-01-03", DCFG, MCfg, GROUP, set())
+check("满期当晚就发分，账记在新人入群的那个月而不是满期月",
+      _awarded_month(111) == "2099-12"
+      and dict(conn2.execute(
+          "SELECT qq, bonus FROM month_score WHERE month='2099-12'").fetchall()
+      ).get(211) == 10
+      and conn2.execute(
+          "SELECT 1 FROM month_score WHERE qq=211 AND month='2100-01'"
+      ).fetchone() is None,
+      (_awarded_month(111),
+       conn2.execute("SELECT qq, month, bonus FROM month_score WHERE qq=211")
+       .fetchall()))
+
+# 入群月已经封账：再往里加分只改榜单、换不来钱，所以要退到当前月
+conn2.execute("UPDATE month_score SET settled=1 WHERE month='2099-12'")
+conn2.commit()
+_seed_newbie(112, 212, datetime.date(2099, 12, 26))
+conn2.commit()
+ds.calc_day("2100-01-04", DCFG, MCfg, GROUP, set())
+check("入群月已结算时拉新分退记到当前月",
+      _awarded_month(112) == "2100-01"
+      and dict(conn2.execute(
+          "SELECT qq, bonus FROM month_score WHERE month='2100-01'").fetchall()
+      ).get(212) == 10,
+      (_awarded_month(112),
+       conn2.execute("SELECT qq, month, bonus, settled FROM month_score WHERE qq=212")
+       .fetchall()))
 
 conn2.close()
 
@@ -579,6 +643,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 main_src = pathlib.Path(HERE, "main.py").read_text("utf-8")
 sched_src = pathlib.Path(HERE, "scheduler.py").read_text("utf-8")
 report_src = pathlib.Path(HERE, "report.py").read_text("utf-8")
+mh_src = pathlib.Path(HERE, "message_handler.py").read_text("utf-8")
 check("QQ 指令渲染模块已删除", not os.path.exists(os.path.join(HERE, "commands.py")))
 n_cmd = main_src.count("@filter.command")
 n_gate = main_src.count("PlatformAdapterType.WEBCHAT")
@@ -1484,7 +1549,7 @@ p10 = make_db("db10")
 conn10 = sqlite3.connect(p10)
 _CFG10 = {
     **_CFG_BASE, "db_path": p10, "group_id": str(GROUP),
-    "invite_bind": {"enabled": True, "window_minutes": 5, "prompt": True},
+    "invite_bind": {"enabled": True, "window_minutes": 5},
 }
 set_plugin_config(_CFG10)
 for q, nm in ((5001, "邀请人一"), (5002, "被绑新人"), (5005, "真正拉人的"),
@@ -1518,12 +1583,16 @@ def _pb(qq):
     ).fetchone()
 
 
-pr = _join10(5002, 5001, "invite", T10)
 check("入群事件开出待确认窗口并记下检测到的邀请人",
-      _pb(5002) == (5001, T10, 0) and _jl(5002) == (5001, 1, "invite"),
+      _join10(5002, 5001, "invite", T10) is None
+      and _pb(5002) == (5001, T10, 0) and _jl(5002) == (5001, 1, "invite"),
       (_pb(5002), _jl(5002)))
-check("开了群内提示才回一份要问谁的话",
-      pr == {"newbie": 5002, "inviter": 5001, "approve": False}, pr)
+check("入群一律不返回要说的话：机器人在群里不出声",
+      _join10(5016, 5001, "invite", T10) is None)
+_jh_seg = mh_src.split("async def handle_group_join")[1]
+check("入群处理里没有任何发群的分支",
+      "plain_result" not in _jh_seg and "prompt" not in _jh_seg.split("finally")[0],
+      _jh_seg[:120])
 ok10 = admin_ops.bind_inviter(5002, 5001, _now=T10 + 60)
 check("邀请人绑定成功并标成人工确认",
       "绑定成功" in ok10 and "人工确认" in ok10 and _jl(5002)[1] == 2, ok10)
@@ -1542,9 +1611,9 @@ _join10(5004, 5009, "approve", T10)
 check("审批入群：流水里留着谁放行的，但窗口里当成没检测到邀请人",
       _jl(5004) == (5009, 1, "approve") and _pb(5004) == (0, T10, 0),
       (_jl(5004), _pb(5004)))
-check("审批入群的群内提示不点名审批人，只喊拉他的人来自认",
-      _join10(5015, 5009, "approve", T10) == {
-          "newbie": 5015, "inviter": 5009, "approve": True})
+check("审批入群也不在群里喊人，只把窗口开成没检测到",
+      _join10(5015, 5009, "approve", T10) is None and _pb(5015) == (0, T10, 0),
+      _pb(5015))
 rebind = admin_ops.bind_inviter(5004, 5005, _now=T10 + 30)
 check("审批入群没有真邀请人，真正拉人的来绑就认",
       "绑定成功" in rebind and "管理员不算邀请人" in rebind and _jl(5004)[0] == 5005,
@@ -1602,9 +1671,12 @@ _join10(5008, 5001, "invite", T10)
 check("一天前没绑上的旧窗口随下一次入群清掉",
       conn10.execute("SELECT COUNT(*) FROM pending_bind WHERE newbie_qq=7777")
       .fetchone()[0] == 0)
-set_plugin_config({**_CFG10, "invite_bind": {"prompt": False}})
-check("群内提示默认不开时不返回任何要说的话",
-      _join10(5010, 5001, "invite", T10) is None)
+check("入群永远不会返回要说的话，配置页也没有\"群内提示\"这一项了",
+      _join10(5010, 5001, "invite", T10) is None
+      and '"prompt"' not in schema_text.split('"invite_bind"')[1].split('"report"')[0])
+_gn_body = main_src.split("async def group_notice")[1].split("@filter", 1)[0]
+check("group_notice 只入库：没有任何回话分支",
+      "yield" not in _gn_body and "plain_result" not in _gn_body, _gn_body[:120])
 set_plugin_config({**_CFG10, "invite_bind": {"enabled": False}})
 off10 = admin_ops.bind_inviter(5011, 5001, _now=T10 + 10)
 check("关掉后指令直接说未启用，不碰库", "未启用" in off10 and _pb(5011) is None, off10)

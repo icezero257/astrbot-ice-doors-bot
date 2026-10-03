@@ -908,9 +908,8 @@ def render_diag(now: datetime.datetime | None = None, fenced: bool = False) -> s
         f"本月待补算日: {', '.join(missing) if missing else '无'}",
         f"本月手工调整: {adj_cnt} 笔 合计 {_fmt_score(adj_sum)} 分（/扣除 记账，重算日分不会抹掉）",
         f"邀请确认窗口: {pend_line}（窗口 {bind_cfg['window_minutes']} 分钟，"
-        f"指令 {'开' if bind_cfg['enabled'] else '关'}，群内提示 "
-        f"{'开' if bind_cfg['prompt'] else '关，机器人在群里不说话'}）；"
-        f"已人工确认 {confirmed} 人",
+        f"指令 {'开' if bind_cfg['enabled'] else '关'}；"
+        f"已人工确认 {confirmed} 人，机器人在群里不出声）",
     ]
     if group_id <= 0:
         lines.append(

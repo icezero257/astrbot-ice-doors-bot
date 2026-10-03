@@ -25,6 +25,9 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = os.path.join(REPO, "doors_bot")
 IDS_FILE = os.path.join(REPO, "local_ids.txt")
 SKIP = {"__pycache__", ".env", "config", "config.zip", "deploy.sh"}
+# 只收插件自带的文件类型。开发目录里顺手丢进去的别的东西（发票、日志、截图）
+# 一律不进仓库也不进发布包。
+ALLOW_EXT = {".py", ".json", ".yaml", ".yml", ".md", ".txt", ".png"}
 # 配置页默认值属于现网信息，发布版一律留空由用户自己填
 BLANK_DEFAULTS = (("group_id", "default"), ("no_score_qqs", "default"))
 
@@ -49,6 +52,9 @@ def sync(src: str) -> int:
     n = 0
     for name in sorted(os.listdir(src)):
         if name in SKIP or os.path.isdir(os.path.join(src, name)) or name.startswith("doors_bot_v"):
+            continue
+        if not name.endswith(tuple(ALLOW_EXT)):
+            print(f"跳过非插件文件: {name}")
             continue
         shutil.copy2(os.path.join(src, name), os.path.join(PLUGIN, name))
         n += 1
@@ -98,7 +104,8 @@ def build_zip(version: str) -> str:
     os.makedirs(os.path.dirname(out), exist_ok=True)
     names = sorted(
         f for f in os.listdir(PLUGIN)
-        if os.path.isfile(os.path.join(PLUGIN, f)) and f not in SKIP
+        if os.path.isfile(os.path.join(PLUGIN, f))
+        and f not in SKIP and f.endswith(tuple(ALLOW_EXT))
     )
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for f in names:

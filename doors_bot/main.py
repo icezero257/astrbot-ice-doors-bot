@@ -35,7 +35,6 @@ from .init_db import init
 from .message_handler import handle_group_join, handle_group_message
 from .runtime_config import (
     get_group_id,
-    get_invite_bind_config,
     set_plugin_config,
 )
 
@@ -102,29 +101,11 @@ class DoorsBot(Star):
     # 这里放开到 ALL，由 handle_group_join 自己按 post_type/notice_type 过滤。
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def group_notice(self, event: AstrMessageEvent):
+        """入群通知只入库，不在群里说话。"""
         try:
-            prompt = await handle_group_join(event)
+            await handle_group_join(event)
         except Exception:
             logger.exception("[doors_bot] 入群事件处理异常")
-            return
-        # 只有配置页打开"进群时催一句"才会走到这里，默认不发任何消息。
-        if prompt:
-            mins = get_invite_bind_config()["window_minutes"]
-            newbie = prompt["newbie"]
-            if prompt.get("approve"):
-                # 管理员放行那次事件里带的人是审批人，不是拉人的人，所以不点名
-                text = (
-                    f"{newbie} 进群时是管理员放行的，看不出谁拉的他："
-                    f"拉他进群的人请在 {mins} 分钟内发 /新人绑定 {newbie}，"
-                    "没人认领就不算拉新。"
-                )
-            else:
-                text = (
-                    f"{prompt['inviter']} 像是把 {newbie} 拉进群的人："
-                    f"{mins} 分钟内发 /新人绑定 {newbie} 就能确认这层邀请关系，"
-                    "不理会照自动检测的结果记账。"
-                )
-            yield event.plain_result(text)
 
     # ---------- 后台指令：仅 AstrBot WebUI 平台可触发 ----------
     # 注意: AstrBot 只在消息以 wake_prefix(默认 "." "//") 开头或有 @ 时剥离前缀。

@@ -200,12 +200,12 @@ async def handle_group_message(event, _now: int | None = None) -> None:
         conn.close()
 
 
-async def handle_group_join(event, _now: int | None = None) -> dict | None:
+async def handle_group_join(event, _now: int | None = None) -> None:
     """处理 NapCat 转发的群入群通知 (group_increase notice)。
 
-    返回 None 表示这条通知不归我们处理。开出了人工确认窗口、且配置页允许在群里
-    催一句时，返回 {"newbie": 新人QQ, "inviter": 入群事件里带的那个QQ,
-    "approve": 这次是不是管理员放行}，由调用方决定怎么问。
+    不归我们处理就直接返回。这里只写库、只写日志，**一个字都不往群里发**：
+    群里的机器人保持沉默，谁拉的这个人由邀请人自己发 `/新人绑定` 确认，
+    待确认窗口的情况在后台 `/自检` 和 AstrBot 日志里看。
     """
     raw = getattr(event.message_obj, "raw_message", None)
     if not isinstance(raw, dict):
@@ -329,12 +329,5 @@ async def handle_group_join(event, _now: int | None = None) -> dict | None:
             )
             + f" 方式 {raw.get('sub_type') or '-'}"
         )
-        # 只有知道该问谁(检测到 operator_id)时才提示，链接/搜索入群没有对象可问。
-        if bind_cfg["enabled"] and bind_cfg["prompt"] and invited_by:
-            return {
-                "newbie": user_id,
-                "inviter": invited_by,
-                "approve": join_kind == "approve",
-            }
     finally:
         conn.close()

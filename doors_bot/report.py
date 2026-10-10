@@ -5,8 +5,9 @@ doors_bot - 后台榜单渲染（仅 AstrBot WebUI 聊天窗 / 本地 cli.py 使
   （群里唯一能用的 /新人绑定 不经过本模块，它也只在群里改库+写日志，不回话）
 - 输出为无 emoji 的等宽对齐表格；ChatUI 侧用 fenced=True 包一层代码块保证对齐
 - 后台属于管理端，输出包含 Robux 列（已结算月为落库值，未结算月为实时预估）
-- 唯一的例外是 render_public_month_board()：它要发进 QQ 群，所以全篇不带任何分数
-  与 Robux（连备注里的"拉新 +10"也要写成"拉新额外奖励"），实际发送在 scheduler.py
+- 唯一的例外是 public_month_board_lines()：它要发进 QQ 群当合并转发用（一行一个
+  转发节点），所以全篇不带任何分数与 Robux（连备注里的"拉新 +10"也要写成
+  "拉新额外奖励"）；纯文本回落用 render_public_month_board()，实际发送在 scheduler.py
 - 本模块只读库，任何改写/删除数据的操作在 admin_ops.py
 """
 
@@ -601,11 +602,12 @@ def render_current_month_board(
 PUBLIC_TITLE = "【当前月月榜】"
 
 
-def render_public_month_board(
+def public_month_board_lines(
     now: datetime.datetime | None = None
-) -> tuple[str, int]:
-    """发进 QQ 群的当月月榜，返回 (文本, 行数)；本月还没有人得分时返回空文本。
+) -> tuple[list[str], int]:
+    """发进 QQ 群的当月月榜，按行返回 (行列表, 行数)；本月还没有人得分时返回空列表。
 
+    合并转发一行一个节点，所以这里必须按行给出去，不能只给一整段文本。
     排版按群内阅读设计，跟后台那张对齐表格是两套东西：
       【当前月月榜】
       #1 <qq号> <qq名> <备注>
@@ -634,21 +636,29 @@ def render_public_month_board(
         else:
             days = [d for d in get_month_range(month) if d <= today]
             if not days:
-                return "", 0
+                return [], 0
             finals, _ = _month_totals(conn, c, month, days)
     finally:
         conn.close()
 
     shown, _ = _apply_limit([[q, t] for q, t in finals], _limit())
     if not shown:
-        return "", 0
+        return [], 0
     ranks = _tie_ranks([float(t) for q, t in shown])
     lines = [PUBLIC_TITLE]
     for rank, (qq, _total) in zip(ranks, shown):
         line = f"#{rank} {qq} {names.get(int(qq), str(qq))}"
         note = notes_map.get(int(qq), "")
         lines.append(f"{line} {note}" if note else line)
-    return "\n".join(lines), len(shown)
+    return lines, len(shown)
+
+
+def render_public_month_board(
+    now: datetime.datetime | None = None
+) -> tuple[str, int]:
+    """同一份月榜合成一整段纯文本——合并转发发不出去时的回落用这个。"""
+    lines, rows = public_month_board_lines(now)
+    return "\n".join(lines), rows
 
 
 def render_last_month_board(
@@ -1002,9 +1012,9 @@ def render_diag(now: datetime.datetime | None = None, fenced: bool = False) -> s
             f"最近补跑: {STATE['catchup'].get('last_run') or '-'} "
             f"{', '.join(STATE['catchup'].get('recomputed') or []) or '无'}",
             f"月榜播报: {b.get('result') or '未运行'} {b.get('last') or '-'} "
-            f"{b.get('rows', 0)} 行 "
+            f"{b.get('rows', 0)} 行 {b.get('via') or '-'} "
             f"（开关 {'开' if get_group_report_config()['enabled'] else '关'}，"
-            f"随每日计分触发，群里那条不带分数）"
+            f"随每日计分触发，群里那条是合并转发、不带分数）"
             + (f" 错误: {b['error']}" if b.get("error") else ""),
         ]
         lines += ["定时任务:"] + [f"  {x}" for x in schedule_info()]

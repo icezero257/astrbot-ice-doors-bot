@@ -2,13 +2,14 @@ name: doors_bot
 display_name: Doors Bot
 desc: >-
   QQ 群活跃统计与 Robux 月度结算。发言只在后台入库计分，群里只在每天日结算后收到一条
-  当月月榜（只有名次、QQ、昵称和备注，不报任何分数，配置 group_report.enabled 可关）；
+  当月月榜的合并转发（只有名次、QQ、昵称和备注，不报任何分数，配置
+  group_report.enabled 可关）；
   看榜、自检、改数据的指令都在 AstrBot WebUI 聊天窗里用（日榜 /日榜、月榜 /月榜、
   单人档 /查询、自检 /自检，运维指令末尾要加 确认）。/新人绑定 群内后台都能用：
   群里邀请人本人认领自己拉进来的新人（不回话，只写库、写日志），后台由管理员
   带邀请人QQ代填，结果看日榜月榜的备注列。
-short_desc: QQ 群活跃统计 + Robux 月结，群里每天一条不带分数的月榜，榜单在后台看
-version: v2.5.7
+short_desc: QQ 群活跃统计 + Robux 月结，群里每天一条不带分数的月榜转发，榜单在后台看
+version: v2.5.8
 author: 冰凌不是冰凌
 repo: ""
 astrbot_version: ">=4.24.0"

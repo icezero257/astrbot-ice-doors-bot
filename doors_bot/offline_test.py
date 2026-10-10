@@ -665,9 +665,10 @@ check("main.py 无发送/回复代码", "send_message" not in main_src
 _gn_seg = main_src.split("async def group_notice")[0].rsplit("@filter", 1)[-1]
 check("入群通知处理器放开到 ALL(AstrBot 把带群号的通知转成 GROUP_MESSAGE)",
       "event_message_type(filter.EventMessageType.ALL)" in _gn_seg, _gn_seg)
-check("唯一发言出口：只有月榜播报会 send_group_msg，且从不发私聊",
+check("唯一发言出口：月榜只发群，一条合并转发+失败时一条纯文本，从不发私聊",
       "send_message" not in sched_src
       and sched_src.count('"send_group_msg"') == 1
+      and sched_src.count('"send_group_forward_msg"') == 1
       and "send_private_msg" not in sched_src
       and "send_group_msg" not in main_src and "send_group_msg" not in mh_src
       and "send_private_msg" not in main_src and "send_private_msg" not in mh_src)
@@ -1811,30 +1812,83 @@ _empty11, _erows = report.render_public_month_board(datetime.datetime(2099, 11, 
 check("整月没人得分就不播（不连着几天往群里刷\"暂无数据\"）",
       _empty11 == "" and _erows == 0, _empty11)
 
-sent11 = FakeBot([])
-sched.set_context(Ctx([FakePlat(sent11, "napcat")]))
+class ForwardBot(FakeBot):
+    """只认 get_login_info 的机器人：转发节点要署名，就得先问出自己是谁。"""
+
+    async def call_action(self, action, **kw):
+        self.calls.append((action, kw))
+        if action == "get_login_info":
+            return {"user_id": 9999, "nickname": "ROSEMEW"}
+        return None
+
+
+class NoForwardBot(ForwardBot):
+    """NapCat 挑掉转发载荷（节点结构不对就整条失败）时只回纯文本的机器人。"""
+
+    async def call_action(self, action, **kw):
+        if action == "send_group_forward_msg":
+            self.calls.append((action, kw))
+            raise RuntimeError("转发消息失败，生成节点为空")
+        return await super().call_action(action, **kw)
+
+
+expect_lines11, _ = report.public_month_board_lines(NOW11)
+fwd11 = ForwardBot([])
+sched.set_context(Ctx([FakePlat(fwd11, "napcat")]))
 ok11, err11 = asyncio.run(sched.broadcast_month_board(NOW11))
-check("播报走 OneBot 的 send_group_msg，发给配置的那个群",
-      ok11 and err11 == "" and len(sent11.calls) == 1
-      and sent11.calls[0][0] == "send_group_msg"
-      and sent11.calls[0][1]["group_id"] == GROUP
-      and sent11.calls[0][1]["message"] == pub11, sent11.calls)
+sent11 = [c for c in fwd11.calls if c[0] == "send_group_forward_msg"]
+check("播报走 OneBot 的 send_group_forward_msg，发给配置的那个群",
+      ok11 and err11 == "" and len(sent11) == 1
+      and sent11[0][1]["group_id"] == GROUP, fwd11.calls)
+nodes11 = sent11[0][1]["messages"]
+check("榜单一行一个转发节点，标题也是其中一个",
+      [n["data"]["content"][0]["data"]["text"] for n in nodes11] == expect_lines11,
+      nodes11)
+check("每个节点是标准 ob11 结构、署名机器人自己",
+      all(n["type"] == "node" and n["data"]["nickname"] == "ROSEMEW"
+          and n["data"]["name"] == "ROSEMEW" and n["data"]["user_id"] == "9999"
+          and n["data"]["uin"] == "9999"
+          and [s["type"] for s in n["data"]["content"]] == ["text"]
+          and set(n["data"]["content"][0]["data"]) == {"text"} for n in nodes11), nodes11)
+check("转发节点里同样没有一个分数",
+      all(x not in str(n) for n in nodes11
+          for x in ("4.35", "2.15", "87", "80", "+10", "Robux")), nodes11)
 st11 = sched.STATE["broadcast"]
-check("发送结果记进自检用的状态", st11["result"] == "已发送" and st11["rows"] == 3, st11)
+check("发送结果记进自检用的状态，并写明走的是合并转发",
+      st11["result"] == "已发送" and st11["rows"] == 3 and st11["via"] == "合并转发", st11)
+_no_nick, _fallback11 = asyncio.run(
+    sched._bot_identity(FakeBot([]).call_action, {}))
+check("问不出机器人是谁时仍给节点留个署名（空昵称会让整条转发失败）",
+      _fallback11 == sched.NODE_NICK_FALLBACK, _fallback11)
 
 set_plugin_config({**_CFG_BASE, "db_path": p11, "group_report": {"enabled": False}})
+off11 = ForwardBot([])
+sched.set_context(Ctx([FakePlat(off11, "napcat")]))
 off_ok, _ = asyncio.run(sched.broadcast_month_board(NOW11))
 check("配置页一关就彻底不再往群里说话",
-      not off_ok and len(sent11.calls) == 1
+      not off_ok and off11.calls == []
       and sched.STATE["broadcast"]["result"] == "已关闭", sched.STATE["broadcast"])
 set_plugin_config({**_CFG_BASE, "db_path": p11})
+
+nf11 = NoForwardBot([])
+sched.set_context(Ctx([FakePlat(nf11, "napcat")]))
+fb_ok, _ = asyncio.run(sched.broadcast_month_board(NOW11))
+check("合并转发被挑掉时回落成一条纯文本，别让整张榜缺席",
+      fb_ok and any(c[0] == "send_group_forward_msg" for c in nf11.calls)
+      and [c[0] for c in nf11.calls if c[0] == "send_group_msg"] == ["send_group_msg"]
+      and nf11.calls[-1][1]["group_id"] == GROUP
+      and nf11.calls[-1][1]["message"] == pub11, nf11.calls[-1])
+check("回落的原因留在自检里，不吞掉",
+      sched.STATE["broadcast"]["via"] == "纯文本"
+      and "生成节点为空" in sched.STATE["broadcast"]["error"], sched.STATE["broadcast"])
 
 bad11 = FakeBot(err="NapCat 没连上")
 sched.set_context(Ctx([FakePlat(bad11, "napcat")]))
 fail_ok, fail_err = asyncio.run(sched.broadcast_month_board(NOW11))
 check("发不出去只记下原因，不抛异常",
       not fail_ok and "NapCat 没连上" in fail_err
-      and "NapCat 没连上" in sched.STATE["broadcast"]["error"], fail_err)
+      and "NapCat 没连上" in sched.STATE["broadcast"]["error"]
+      and sched.STATE["broadcast"]["via"] == "", fail_err)
 sched.set_context(Ctx([FakePlat(FakeBot([]), "napcat")]))
 asyncio.run(sched.daily_job())  # 真实当天：db11 里没有这个月的分数
 check("每日任务先算分紧接着播，当月没分就跳过",
@@ -1843,7 +1897,8 @@ check("每日任务先算分紧接着播，当月没分就跳过",
 check("机器人自己发的那条不会被当成发言计分",
       "str(event.get_self_id())" in mh_src, "message_handler 里没有拦自己的发言")
 diag11 = report.render_diag(now=NOW11)
-check("自检里看得到月榜播没播出去", "月榜播报" in diag11, diag11)
+check("自检里看得到月榜播没播出去、平时是转发还是纯文本",
+      "月榜播报" in diag11 and "合并转发" in diag11, diag11)
 
 ms.settle("2099-12", MCfg)
 pub11s, rows11s = report.render_public_month_board(datetime.datetime(2099, 12, 31, 23, 59))

@@ -2,7 +2,8 @@
 doors_bot - 定时任务
 
 - 每日(默认23:59): 计算当日得分 + 邀请奖励判定，紧接着把"本月到目前为止"的
-  月榜发进目标群（唯一的群内发言，内容不含任何分数，见 group_report.enabled）
+  月榜做成一条合并转发发进目标群（唯一的群内发言，一行一个转发节点，
+  内容不含任何分数，见 group_report.enabled；转发失败时回落成一条纯文本）
 - 每月1日(默认09:00): 结算上月，结果写数据库 month_score(含robux列)
   并导出 pay_list_YYYY-MM.txt
 - 每N分钟(默认30): 补跑漏算的日期。23:59 任务只在进程活着时才会跑，
@@ -31,7 +32,7 @@ from astrbot.api import logger
 
 from .daily_score import calc_day
 from .monthly_settle import settle
-from .report import render_public_month_board
+from .report import public_month_board_lines, render_public_month_board
 from .runtime_config import (
     get_daily_config,
     get_db_path,
@@ -50,7 +51,7 @@ STATE: dict[str, dict] = {
     "sync": {"last_attempt": "", "last_ok": "", "count": 0, "platform": "",
              "error": "", "attempts": 0, "routing": ""},
     "catchup": {"last_run": "", "recomputed": []},
-    "broadcast": {"last": "", "rows": 0, "result": "未运行", "error": ""},
+    "broadcast": {"last": "", "rows": 0, "result": "未运行", "error": "", "via": ""},
 }
 
 _TZ: ZoneInfo | None = None
@@ -194,7 +195,7 @@ def run_catchup(
 async def broadcast_month_board(
     now: datetime.datetime | None = None,
 ) -> tuple[bool, str]:
-    """把当月月榜（不带分数）发进目标群，每天跟着日结算走一次。
+    """把当月月榜（不带分数）做成一条合并转发发进目标群，每天跟着日结算走一次。
 
     本月还没人得分就直接跳过：月初连着几天播"暂无数据"只会招人嫌。
     返回 (是否发出, 说明)，说明同时记进 STATE["broadcast"] 给 /自检 看。
@@ -204,18 +205,33 @@ async def broadcast_month_board(
     if not get_group_report_config()["enabled"]:
         state["result"], state["error"] = "已关闭", ""
         return False, "配置里关掉了每日月榜播报"
-    text, rows = render_public_month_board(now)
-    if not text:
+    lines, rows = public_month_board_lines(now)
+    if not lines:
         state["last"] = now.strftime("%Y-%m-%d %H:%M:%S")
-        state["rows"], state["result"], state["error"] = 0, "本月暂无积分记录，跳过", ""
+        state["rows"], state["result"] = 0, "本月暂无积分记录，跳过"
+        state["via"], state["error"] = "", ""
         return False, "本月暂无积分记录"
-    ok, error = await _send_group_text(text)
+    ok, error = await _send_group_forward(lines)
+    via = FORWARD_VIA
+    if not ok:
+        # 转发载荷被 NapCat 挑掉了不等于这榜不能播：改成一条纯文本，别让整张榜缺席。
+        text, _ = render_public_month_board(now)
+        plain_ok, plain_err = await _send_group_text(text)
+        if plain_ok:
+            ok, via = True, PLAIN_VIA
+            error = f"合并转发没发出去({error})，已改发纯文本"
+        else:
+            error = f"合并转发没发出去({error})；纯文本也没发出去({plain_err})"
     state["last"] = now.strftime("%Y-%m-%d %H:%M:%S")
     state["rows"] = rows
+    state["via"] = via if ok else ""
     state["result"] = "已发送" if ok else "失败"
-    state["error"] = error
+    state["error"] = error if (not ok or via == PLAIN_VIA) else ""
     if ok:
-        logger.info(f"[doors_bot] 月榜播报已发到群 {get_group_id()}: {rows} 行")
+        logger.info(
+            f"[doors_bot] 月榜播报已发到群 {get_group_id()}: "
+            f"{rows} 行（{via}）" + (f" {error}" if via == PLAIN_VIA else "")
+        )
     else:
         logger.warning(f"[doors_bot] 月榜播报没发出去: {error}")
     return ok, error
@@ -328,7 +344,7 @@ def _retryable(errors: list[str]) -> bool:
 
 
 async def _send_group_text(text: str) -> tuple[bool, str]:
-    """把一段文本发进目标群——本插件唯一主动发言的地方。
+    """把一段文本发进目标群——只在合并转发发不出去时当回落用。
 
     路由与拉名单同一套：后台任务不在事件上下文里，aiocqhttp 要靠 self_id 才能
     选中那条反向 WS，没连上就抛 ApiNotAvailable。发送失败不重试：内容本来就是
@@ -343,6 +359,68 @@ async def _send_group_text(text: str) -> tuple[bool, str]:
             try:
                 await call_action(
                     "send_group_msg", group_id=group_id, message=text, **kwargs
+                )
+            except Exception as e:
+                errors.append(f"{meta_id}{_kwargs_tag(kwargs)}: {_describe_error(e)}")
+                continue
+            return True, ""
+    return False, "; ".join(errors)[-400:] or "没有可用的 OneBot 平台实例"
+
+
+FORWARD_VIA = "合并转发"
+PLAIN_VIA = "纯文本"
+NODE_NICK_FALLBACK = "群月榜"
+
+
+def _forward_node(text: str, uin: str, nick: str) -> dict:
+    """一个转发节点装榜单的一行，content 是标准 ob11 段数组。
+
+    NapCat 对节点结构很挑：nickname 或 content 缺一个就整条转发失败，
+    用户号在不同实现里叫 user_id 也叫 uin，两个都给上最省事。
+    """
+    data = {
+        "nickname": nick,
+        "name": nick,
+        "content": [{"type": "text", "data": {"text": text}}],
+    }
+    if uin:
+        data["user_id"] = uin
+        data["uin"] = uin
+    return {"type": "node", "data": data}
+
+
+async def _bot_identity(call_action, kwargs: dict) -> tuple[str, str]:
+    """转发节点统一署名机器人自己：号与昵称走只读的 get_login_info，
+    拿不到就退回事件里记下的 self_id，再不行用栏目名兜底——昵称不能空。"""
+    from .message_handler import get_self_id
+
+    uin = str(get_self_id() or "")
+    nick = ""
+    try:
+        info = await call_action("get_login_info", **kwargs)
+    except Exception:
+        info = None
+    if isinstance(info, dict):
+        uin = str(info.get("user_id") or uin)
+        nick = str(info.get("nickname") or "").strip()
+    return uin, nick or NODE_NICK_FALLBACK
+
+
+async def _send_group_forward(lines: list[str]) -> tuple[bool, str]:
+    """榜单逐行做成转发节点，合并成一条消息发进目标群。"""
+    group_id = get_group_id()
+    if not group_id:
+        return False, "未配置 group_id"
+    errors: list[str] = []
+    for meta_id, call_action, bot in _platform_candidates():
+        for kwargs in _route_variants(bot):
+            uin, nick = await _bot_identity(call_action, kwargs)
+            try:
+                await call_action(
+                    "send_group_forward_msg",
+                    group_id=group_id,
+                    messages=[_forward_node(line, uin, nick) for line in lines],
+                    **kwargs,
                 )
             except Exception as e:
                 errors.append(f"{meta_id}{_kwargs_tag(kwargs)}: {_describe_error(e)}")

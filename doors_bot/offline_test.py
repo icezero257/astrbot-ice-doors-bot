@@ -665,8 +665,16 @@ check("main.py 无发送/回复代码", "send_message" not in main_src
 _gn_seg = main_src.split("async def group_notice")[0].rsplit("@filter", 1)[-1]
 check("入群通知处理器放开到 ALL(AstrBot 把带群号的通知转成 GROUP_MESSAGE)",
       "event_message_type(filter.EventMessageType.ALL)" in _gn_seg, _gn_seg)
-check("scheduler.py 无主动发消息", "send_message" not in sched_src
-      and "send_group_msg" not in sched_src and "send_private_msg" not in sched_src)
+check("唯一发言出口：只有月榜播报会 send_group_msg，且从不发私聊",
+      "send_message" not in sched_src
+      and sched_src.count('"send_group_msg"') == 1
+      and "send_private_msg" not in sched_src
+      and "send_group_msg" not in main_src and "send_group_msg" not in mh_src
+      and "send_private_msg" not in main_src and "send_private_msg" not in mh_src)
+check("月榜播报只跟着每日计分触发，别的地方不调它",
+      "await broadcast_month_board()" in sched_src
+      and sched_src.count("broadcast_month_board(") == 2,  # def + daily_job 里那一处
+      sched_src.count("broadcast_month_board("))
 check("report.py 纯读库无发送", "send" not in report_src)
 admin_src = pathlib.Path(HERE, "admin_ops.py").read_text("utf-8")
 check("report.py 不写库", not any(
@@ -1758,6 +1766,91 @@ check("只有后台那条路径是管理员代填，群里发的一律按本人�
 check("WebUI 里发绑定仍然回全文(便于管理员测试)",
       "yield event.plain_result(text)" in _bind_seg, _bind_seg)
 conn10.close()
+
+# ================= DB11: 每日月榜群内播报（唯一出声的地方，且不报分） =================
+print("== DB11: daily month board broadcast ==")
+p11 = make_db("db11")
+conn11 = sqlite3.connect(p11)
+for q, nm in ((4001, "邀请人甲"), (4002, "玩家乙"), (4003, "新人丙"), (4004, "路过丁")):
+    conn11.execute("INSERT INTO user_info(qq, name) VALUES(?,?)", (q, nm))
+conn11.execute("INSERT INTO daily_score VALUES(4001,'2099-12-01',4.35,87)")
+conn11.execute("INSERT INTO daily_score VALUES(4002,'2099-12-01',4.35,80)")
+conn11.execute("INSERT INTO daily_score VALUES(4003,'2099-12-01',2.15,40)")
+conn11.execute("INSERT INTO daily_score VALUES(4004,'2099-12-01',0.0,0)")
+conn11.execute(
+    "INSERT INTO join_log(qq, group_id, invited_by, join_date, invited_src, join_kind) "
+    "VALUES(4003,?,4001,'2099-12-01',1,'invite')", (GROUP,))
+conn11.execute(
+    "INSERT INTO join_history(qq, group_id, join_date, invited_by) "
+    "VALUES(4003,?,'2099-12-01',4001)", (GROUP,))
+conn11.execute(
+    "INSERT INTO newbie_bonus(newbie_qq, inviter_qq, awarded_month, bonus) "
+    "VALUES(4003,4001,'2099-12',10)")
+conn11.commit()
+
+NOW11 = datetime.datetime(2099, 12, 20, 23, 59)
+pub11, rows11 = report.render_public_month_board(NOW11)
+lines11 = pub11.splitlines()
+check("群内那份的标题原样是【当前月月榜】", lines11[0] == "【当前月月榜】", pub11)
+check("群内那份每一行是 #名次 QQ号 昵称 备注",
+      lines11[1] == "#1 4001 邀请人甲 拉新额外奖励（新人丙 达标）", lines11)
+check("同分并列都算第1，下一名跳到第3",
+      [l.split()[0] for l in lines11[1:]] == ["#1", "#1", "#3"], lines11)
+check("群内那份从头到尾没有一个分数",
+      all(x not in pub11 for x in ("4.35", "2.15", "87", "80", "+", "分", "R")), pub11)
+check("拉新备注只说有这么笔奖励，不写金额",
+      "拉新 +10" not in pub11 and "拉新额外奖励" in pub11, pub11)
+check("0 分的人不上群内榜（未发言扣分扣到 0 的也不列）",
+      "路过丁" not in pub11 and "4004" not in pub11, pub11)
+check("后台月榜照旧报分报奖金，只有群内那份不报",
+      all(x in report.render_month_board("2099-12", now=NOW11)
+          for x in ("4.35", "拉新 +10（新人丙 达标）")), report.render_month_board("2099-12", now=NOW11))
+check("群内榜与后台榜名次同源",
+      [l.split()[1] for l in lines11[1:]] == ["4001", "4002", "4003"], lines11)
+_empty11, _erows = report.render_public_month_board(datetime.datetime(2099, 11, 5, 23, 59))
+check("整月没人得分就不播（不连着几天往群里刷\"暂无数据\"）",
+      _empty11 == "" and _erows == 0, _empty11)
+
+sent11 = FakeBot([])
+sched.set_context(Ctx([FakePlat(sent11, "napcat")]))
+ok11, err11 = asyncio.run(sched.broadcast_month_board(NOW11))
+check("播报走 OneBot 的 send_group_msg，发给配置的那个群",
+      ok11 and err11 == "" and len(sent11.calls) == 1
+      and sent11.calls[0][0] == "send_group_msg"
+      and sent11.calls[0][1]["group_id"] == GROUP
+      and sent11.calls[0][1]["message"] == pub11, sent11.calls)
+st11 = sched.STATE["broadcast"]
+check("发送结果记进自检用的状态", st11["result"] == "已发送" and st11["rows"] == 3, st11)
+
+set_plugin_config({**_CFG_BASE, "db_path": p11, "group_report": {"enabled": False}})
+off_ok, _ = asyncio.run(sched.broadcast_month_board(NOW11))
+check("配置页一关就彻底不再往群里说话",
+      not off_ok and len(sent11.calls) == 1
+      and sched.STATE["broadcast"]["result"] == "已关闭", sched.STATE["broadcast"])
+set_plugin_config({**_CFG_BASE, "db_path": p11})
+
+bad11 = FakeBot(err="NapCat 没连上")
+sched.set_context(Ctx([FakePlat(bad11, "napcat")]))
+fail_ok, fail_err = asyncio.run(sched.broadcast_month_board(NOW11))
+check("发不出去只记下原因，不抛异常",
+      not fail_ok and "NapCat 没连上" in fail_err
+      and "NapCat 没连上" in sched.STATE["broadcast"]["error"], fail_err)
+sched.set_context(Ctx([FakePlat(FakeBot([]), "napcat")]))
+asyncio.run(sched.daily_job())  # 真实当天：db11 里没有这个月的分数
+check("每日任务先算分紧接着播，当月没分就跳过",
+      sched.STATE["broadcast"]["result"] == "本月暂无积分记录，跳过"
+      and sched.STATE["broadcast"]["rows"] == 0, sched.STATE["broadcast"])
+check("机器人自己发的那条不会被当成发言计分",
+      "str(event.get_self_id())" in mh_src, "message_handler 里没有拦自己的发言")
+diag11 = report.render_diag(now=NOW11)
+check("自检里看得到月榜播没播出去", "月榜播报" in diag11, diag11)
+
+ms.settle("2099-12", MCfg)
+pub11s, rows11s = report.render_public_month_board(datetime.datetime(2099, 12, 31, 23, 59))
+check("已经结算的那个月照样能播，Robux 与总分都不露面",
+      rows11s == 3 and pub11s.splitlines()[0] == "【当前月月榜】"
+      and all(x not in pub11s for x in ("4.35", "R", "分")), pub11s)
+conn11.close()
 
 # 汇总
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")

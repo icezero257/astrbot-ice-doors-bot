@@ -5,6 +5,8 @@ doors_bot - 后台榜单渲染（仅 AstrBot WebUI 聊天窗 / 本地 cli.py 使
   （群里唯一能用的 /新人绑定 不经过本模块，它也只在群里改库+写日志，不回话）
 - 输出为无 emoji 的等宽对齐表格；ChatUI 侧用 fenced=True 包一层代码块保证对齐
 - 后台属于管理端，输出包含 Robux 列（已结算月为落库值，未结算月为实时预估）
+- 唯一的例外是 render_public_month_board()：它要发进 QQ 群，所以全篇不带任何分数
+  与 Robux（连备注里的"拉新 +10"也要写成"拉新额外奖励"），实际发送在 scheduler.py
 - 本模块只读库，任何改写/删除数据的操作在 admin_ops.py
 """
 
@@ -30,6 +32,7 @@ from .runtime_config import (
     get_data_dir,
     get_db_path,
     get_group_id,
+    get_group_report_config,
     get_invite_bind_config,
     get_monthly_config,
     get_no_score_qqs,
@@ -227,9 +230,13 @@ def _newbie_notes(
 
 
 def _invite_award_notes(
-    c: sqlite3.Cursor, names: dict[int, str], month: str
+    c: sqlite3.Cursor, names: dict[int, str], month: str,
+    show_score: bool = True,
 ) -> dict[int, str]:
-    """谁在这个月因为拉新拿到过邀请分（奖励记在邀请人头上，被拉的人不加分）。"""
+    """谁在这个月因为拉新拿到过邀请分（奖励记在邀请人头上，被拉的人不加分）。
+
+    show_score=False 给群内播报用：只说"有这笔额外奖励、是给谁的"，不报金额。
+    """
     grouped: dict[int, list[str]] = {}
     try:
         rows = c.execute(
@@ -241,18 +248,18 @@ def _invite_award_notes(
         return {}
     for inv, newbie, bonus in rows:
         who = names.get(int(newbie), "") or str(newbie)
-        grouped.setdefault(int(inv), []).append(
-            f"拉新 +{_fmt_score(bonus)}（{who} 达标）"
-        )
+        how = f"拉新 +{_fmt_score(bonus)}" if show_score else "拉新额外奖励"
+        grouped.setdefault(int(inv), []).append(f"{how}（{who} 达标）")
     return {qq: "，".join(v) for qq, v in grouped.items()}
 
 
 def _notes(
-    c: sqlite3.Cursor, names: dict[int, str], month: str
+    c: sqlite3.Cursor, names: dict[int, str], month: str,
+    show_score: bool = True,
 ) -> dict[int, str]:
     """一张榜的备注：新人/邀请人 与 拉新得分，都拼在最后一列里。"""
     out = dict(_newbie_notes(c, names, month))
-    awards = _invite_award_notes(c, names, month)
+    awards = _invite_award_notes(c, names, month, show_score)
     for qq, text in awards.items():
         out[qq] = f"{out[qq]}；{text}" if qq in out else text
     return out
@@ -475,16 +482,16 @@ def month_final(
     return max(0.0, round(base + carry + bonus + adjust.get(qq, 0.0), 2))
 
 
-def _render_live_month(
-    conn: sqlite3.Connection, c: sqlite3.Cursor, month: str, names: dict[int, str],
-    limit: int, now: datetime.datetime, fenced: bool,
-) -> str:
-    """未结算月份的实时预估榜：日分 + 漏算日实时补算 + 结转/邀请分，套系数。"""
+def _month_totals(
+    conn: sqlite3.Connection, c: sqlite3.Cursor, month: str, days: list[str]
+) -> tuple[list[tuple[int, float]], list[str]]:
+    """本月 days 覆盖到的 (QQ, 总分)，按分数降序、同分按 QQ 升序。
+
+    日分 + 漏算日实时补算 + 结转/邀请分，再套新人与连续获奖系数。实时月榜与
+    23:59 的群内播报共用这一条，两边名次才不会打架。附带的 missing 是本轮现算
+    补上的日期，只有后台榜拿来加注。
+    """
     cfg_m = get_monthly_config()
-    last_day = now.strftime("%Y-%m-%d")
-    days = [d for d in get_month_range(month) if d <= last_day]
-    if not days:
-        return _fence(f"发言月榜 {month}\n该月尚未开始，无数据", fenced)
     daily: dict[int, float] = {}
     for qq, s in c.execute(
         "SELECT qq, SUM(COALESCE(score,0)) FROM daily_score "
@@ -493,7 +500,7 @@ def _render_live_month(
     ):
         daily[int(qq)] = float(s or 0)
 
-    missing = _missing_days(c, month, last_day)
+    missing = _missing_days(c, month, days[-1])
     if missing:
         for qq, s in _live_day_scores(conn, missing).items():
             daily[qq] = round(daily.get(qq, 0.0) + s, 2)
@@ -507,15 +514,29 @@ def _render_live_month(
 
     # /扣除 的手工账调整：与结算同一口径，实时榜不含它就与最终月榜对不上
     adjust = adjust_totals(c, month)
-    notes_map = _notes(c, names, month)
 
     finals: list[tuple[int, float]] = []
     for qq in set(daily) | set(credits) | set(adjust):
         finals.append(
             (qq, month_final(c, qq, month, daily.get(qq, 0.0), credits, adjust, cfg_m))
         )
-
     finals.sort(key=lambda x: (-x[1], x[0]))  # 同分按 QQ 升序，保证每次输出顺序一致
+    return finals, missing
+
+
+def _render_live_month(
+    conn: sqlite3.Connection, c: sqlite3.Cursor, month: str, names: dict[int, str],
+    limit: int, now: datetime.datetime, fenced: bool,
+) -> str:
+    """未结算月份的实时预估榜：日分 + 漏算日实时补算 + 结转/邀请分，套系数。"""
+    cfg_m = get_monthly_config()
+    last_day = now.strftime("%Y-%m-%d")
+    days = [d for d in get_month_range(month) if d <= last_day]
+    if not days:
+        return _fence(f"发言月榜 {month}\n该月尚未开始，无数据", fenced)
+    finals, missing = _month_totals(conn, c, month, days)
+    notes_map = _notes(c, names, month)
+
     top_n = int(cfg_m["top_n"])
     per = int(cfg_m["award_per_top"])
     title = f"发言月榜(实时预估) {days[0]} ~ {days[-1]}"
@@ -575,6 +596,59 @@ def render_current_month_board(
 ) -> str:
     now = now or datetime.datetime.now()
     return render_month_board(now.strftime("%Y-%m"), now=now, fenced=fenced)
+
+
+PUBLIC_TITLE = "【当前月月榜】"
+
+
+def render_public_month_board(
+    now: datetime.datetime | None = None
+) -> tuple[str, int]:
+    """发进 QQ 群的当月月榜，返回 (文本, 行数)；本月还没有人得分时返回空文本。
+
+    排版按群内阅读设计，跟后台那张对齐表格是两套东西：
+      【当前月月榜】
+      #1 <qq号> <qq名> <备注>
+    名次同分并列（1,2,2,4），0 分的行不显示，条数沿用后台的 榜单条数 设置。
+    全篇不出现分数、句数与 Robux，备注里的"拉新 +10"在这里写成"拉新额外奖励"——
+    群里都是玩家，报分等于公开每个人的收益。名次依据与后台实时月榜同源
+    （见 _month_totals），所以两边排名一致。
+    """
+    now = now or datetime.datetime.now()
+    month = now.strftime("%Y-%m")
+    today = now.strftime("%Y-%m-%d")
+    conn = sqlite3.connect(get_db_path())
+    try:
+        c = conn.cursor()
+        names = _names(c)
+        notes_map = _notes(c, names, month, show_score=False)
+        if _month_settled(c, month):
+            finals = [
+                (int(q), float(t or 0))
+                for q, t in c.execute(
+                    "SELECT qq, total FROM month_score "
+                    "WHERE month=? AND settled=1 ORDER BY total DESC, qq",
+                    (month,),
+                )
+            ]
+        else:
+            days = [d for d in get_month_range(month) if d <= today]
+            if not days:
+                return "", 0
+            finals, _ = _month_totals(conn, c, month, days)
+    finally:
+        conn.close()
+
+    shown, _ = _apply_limit([[q, t] for q, t in finals], _limit())
+    if not shown:
+        return "", 0
+    ranks = _tie_ranks([float(t) for q, t in shown])
+    lines = [PUBLIC_TITLE]
+    for rank, (qq, _total) in zip(ranks, shown):
+        line = f"#{rank} {qq} {names.get(int(qq), str(qq))}"
+        note = notes_map.get(int(qq), "")
+        lines.append(f"{line} {note}" if note else line)
+    return "\n".join(lines), len(shown)
 
 
 def render_last_month_board(
@@ -909,7 +983,7 @@ def render_diag(now: datetime.datetime | None = None, fenced: bool = False) -> s
         f"本月手工调整: {adj_cnt} 笔 合计 {_fmt_score(adj_sum)} 分（/扣除 记账，重算日分不会抹掉）",
         f"邀请确认窗口: {pend_line}（窗口 {bind_cfg['window_minutes']} 分钟，"
         f"指令 {'开' if bind_cfg['enabled'] else '关'}；"
-        f"已人工确认 {confirmed} 人，机器人在群里不出声）",
+        f"已人工确认 {confirmed} 人，绑定这件事在群里不吭声）",
     ]
     if group_id <= 0:
         lines.append(
@@ -919,6 +993,7 @@ def render_diag(now: datetime.datetime | None = None, fenced: bool = False) -> s
         from .scheduler import STATE, schedule_info
 
         s = STATE["sync"]
+        b = STATE.get("broadcast", {})
         lines += [
             f"成员同步: 成功 {s.get('last_ok') or '从未'} 尝试 {s.get('last_attempt') or '-'} "
             f"{s.get('count', 0)} 人 平台 {s.get('platform') or '-'} "
@@ -926,6 +1001,11 @@ def render_diag(now: datetime.datetime | None = None, fenced: bool = False) -> s
             f"同步错误: {s.get('error') or '无'}",
             f"最近补跑: {STATE['catchup'].get('last_run') or '-'} "
             f"{', '.join(STATE['catchup'].get('recomputed') or []) or '无'}",
+            f"月榜播报: {b.get('result') or '未运行'} {b.get('last') or '-'} "
+            f"{b.get('rows', 0)} 行 "
+            f"（开关 {'开' if get_group_report_config()['enabled'] else '关'}，"
+            f"随每日计分触发，群里那条不带分数）"
+            + (f" 错误: {b['error']}" if b.get("error") else ""),
         ]
         lines += ["定时任务:"] + [f"  {x}" for x in schedule_info()]
     except Exception as e:  # 独立运行(cli.py)时可能没有 apscheduler

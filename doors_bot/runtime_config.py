@@ -224,6 +224,15 @@ def get_invite_bind_config() -> dict[str, Any]:
     }
 
 
+def get_group_report_config() -> dict[str, Any]:
+    """每日月榜群内播报——本插件唯一会往群里发消息的功能。
+
+    跟着每日计分那次触发（默认 23:59），榜单内容一律不含分数。
+    """
+    section = _section("group_report")
+    return {"enabled": _to_bool(section.get("enabled"), True)}
+
+
 def get_scheduler_config() -> dict[str, Any]:
     section = _section("scheduler")
     return {

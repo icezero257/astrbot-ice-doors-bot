@@ -1,7 +1,8 @@
 """
 doors_bot - AstrBot 插件入口 (v4.x)
 
-机器人在 QQ 群里不出声：不主动发任何消息，也不回普通聊天。
+机器人在 QQ 群里几乎不出声：不回普通聊天，也不发通知。唯一会发出去的消息是
+每日计分结束后那一条当月月榜（不含分数，配置页 group_report.enabled 可关）。
 - 静默记录目标群有效发言（纯文本、去重防刷屏、120秒多人窗口计分）
 - 每日计分/扣分、月度结算、Robux 榜单全部写入数据库与 pay_list 文件
 后台查看与运维：只在 AstrBot WebUI 聊天窗里用下面的指令（QQ 里发这些不会有响应）。
@@ -59,7 +60,7 @@ def _is_webchat(event: AstrMessageEvent) -> bool:
 
 
 class DoorsBot(Star):
-    """QQ 群活跃统计与 Robux 月度结算（群内静默，榜单与运维在 WebUI 后台）"""
+    """QQ 群活跃统计与 Robux 月度结算（群里只发每天一条月榜，榜单与运维在 WebUI 后台）"""
 
     def __init__(self, context, config: dict | None = None):
         super().__init__(context)
@@ -70,7 +71,7 @@ class DoorsBot(Star):
             logger.warning(
                 "[doors_bot] 未配置目标群 group_id：发言不会入库，榜单会是空的"
             )
-        logger.info("Doors Bot 已加载（静默模式）")
+        logger.info("Doors Bot 已加载（除每天一条月榜外，群内静默）")
 
     async def initialize(self):
         sched.set_context(self.context)

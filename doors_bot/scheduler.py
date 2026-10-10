@@ -1,7 +1,8 @@
 """
-doors_bot - 定时任务（纯后台，不发送任何消息）
+doors_bot - 定时任务
 
-- 每日(默认23:59): 计算当日得分 + 邀请奖励判定
+- 每日(默认23:59): 计算当日得分 + 邀请奖励判定，紧接着把"本月到目前为止"的
+  月榜发进目标群（唯一的群内发言，内容不含任何分数，见 group_report.enabled）
 - 每月1日(默认09:00): 结算上月，结果写数据库 month_score(含robux列)
   并导出 pay_list_YYYY-MM.txt
 - 每N分钟(默认30): 补跑漏算的日期。23:59 任务只在进程活着时才会跑，
@@ -11,6 +12,8 @@ doors_bot - 定时任务（纯后台，不发送任何消息）
   作为扣分名单与回流判定依据（只读接口，不发消息）。
   AstrBot 刚启动时 NapCat 的反向 WS 常常还没连上，这时调 OneBot 接口会抛
   ApiNotAvailable，所以同步自带退避重试（见 SYNC_RETRY_SECONDS）。
+
+除日结算后的那一条月榜以外，这里所有任务都只读库、只读接口，不发消息。
 
 时区: 配置页 scheduler.timezone（留空跟随系统本地时区）。
 """
@@ -28,10 +31,12 @@ from astrbot.api import logger
 
 from .daily_score import calc_day
 from .monthly_settle import settle
+from .report import render_public_month_board
 from .runtime_config import (
     get_daily_config,
     get_db_path,
     get_group_id,
+    get_group_report_config,
     get_monthly_config,
     get_no_score_qqs,
     get_scheduler_config,
@@ -45,6 +50,7 @@ STATE: dict[str, dict] = {
     "sync": {"last_attempt": "", "last_ok": "", "count": 0, "platform": "",
              "error": "", "attempts": 0, "routing": ""},
     "catchup": {"last_run": "", "recomputed": []},
+    "broadcast": {"last": "", "rows": 0, "result": "未运行", "error": ""},
 }
 
 _TZ: ZoneInfo | None = None
@@ -185,6 +191,36 @@ def run_catchup(
     return done
 
 
+async def broadcast_month_board(
+    now: datetime.datetime | None = None,
+) -> tuple[bool, str]:
+    """把当月月榜（不带分数）发进目标群，每天跟着日结算走一次。
+
+    本月还没人得分就直接跳过：月初连着几天播"暂无数据"只会招人嫌。
+    返回 (是否发出, 说明)，说明同时记进 STATE["broadcast"] 给 /自检 看。
+    """
+    state = STATE["broadcast"]
+    now = now or _now()
+    if not get_group_report_config()["enabled"]:
+        state["result"], state["error"] = "已关闭", ""
+        return False, "配置里关掉了每日月榜播报"
+    text, rows = render_public_month_board(now)
+    if not text:
+        state["last"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        state["rows"], state["result"], state["error"] = 0, "本月暂无积分记录，跳过", ""
+        return False, "本月暂无积分记录"
+    ok, error = await _send_group_text(text)
+    state["last"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    state["rows"] = rows
+    state["result"] = "已发送" if ok else "失败"
+    state["error"] = error
+    if ok:
+        logger.info(f"[doors_bot] 月榜播报已发到群 {get_group_id()}: {rows} 行")
+    else:
+        logger.warning(f"[doors_bot] 月榜播报没发出去: {error}")
+    return ok, error
+
+
 async def daily_job() -> None:
     cfg = get_daily_config()
     monthly_cfg = get_monthly_config()
@@ -194,6 +230,8 @@ async def daily_job() -> None:
         logger.info("[doors_bot] 每日计分完成")
     except Exception:
         logger.exception("[doors_bot] 每日计分失败")
+        return  # 库都读不稳妥，发出去的榜只会是错的
+    await broadcast_month_board()
 
 
 async def monthly_job() -> None:
@@ -246,7 +284,7 @@ def _wsr_client_ids(bot) -> list:
         return []
 
 
-def _member_call_variants(bot) -> list[dict]:
+def _route_variants(bot) -> list[dict]:
     """调用参数候选：先带 self_id（事件里记下来的、再连接表里的），再退回不带。"""
     from .message_handler import get_self_id
 
@@ -257,9 +295,11 @@ def _member_call_variants(bot) -> list[dict]:
     for key in _wsr_client_ids(bot):
         if key not in bases:
             bases.append(key)
-    variants = [{"self_id": b} for b in bases]
-    variants += [{}, {"no_cache": True}]
-    return variants
+    return [{"self_id": b} for b in bases] + [{}]
+
+
+def _member_call_variants(bot) -> list[dict]:
+    return _route_variants(bot) + [{"no_cache": True}]
 
 
 def _describe_error(exc: BaseException) -> str:
@@ -285,6 +325,30 @@ def _retryable(errors: list[str]) -> bool:
     if not errors:
         return True
     return all(any(mark in e for mark in _RETRY_MARKS) for e in errors)
+
+
+async def _send_group_text(text: str) -> tuple[bool, str]:
+    """把一段文本发进目标群——本插件唯一主动发言的地方。
+
+    路由与拉名单同一套：后台任务不在事件上下文里，aiocqhttp 要靠 self_id 才能
+    选中那条反向 WS，没连上就抛 ApiNotAvailable。发送失败不重试：内容本来就是
+    "本月到目前为止"，第二天那一次会带上今天缺的那段。
+    """
+    group_id = get_group_id()
+    if not group_id:
+        return False, "未配置 group_id"
+    errors: list[str] = []
+    for meta_id, call_action, bot in _platform_candidates():
+        for kwargs in _route_variants(bot):
+            try:
+                await call_action(
+                    "send_group_msg", group_id=group_id, message=text, **kwargs
+                )
+            except Exception as e:
+                errors.append(f"{meta_id}{_kwargs_tag(kwargs)}: {_describe_error(e)}")
+                continue
+            return True, ""
+    return False, "; ".join(errors)[-400:] or "没有可用的 OneBot 平台实例"
 
 
 async def _fetch_group_members(group_id: int) -> tuple[list | None, str, list[str]]:
